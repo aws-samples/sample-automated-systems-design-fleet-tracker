@@ -1,0 +1,36 @@
+{
+  "downtown-loop": {
+    "name": "Downtown San Francisco Loop",
+    "description": "Route through downtown SF landmarks",
+    "waypoints": [
+      { "lat": 37.7749, "lng": -122.4194, "name": "Union Square" },
+      { "lat": 37.7879, "lng": -122.4074, "name": "Financial District" },
+      { "lat": 37.7955, "lng": -122.3937, "name": "Embarcadero" },
+      { "lat": 37.8024, "lng": -122.4058, "name": "North Beach" },
+      { "lat": 37.7989, "lng": -122.4262, "name": "Marina" },
+      { "lat": 37.7855, "lng": -122.4364, "name": "Pacific Heights" }
+    ]
+  },
+  "suburban-route": {
+    "name": "Bay Area Suburban Route",
+    "description": "Route through South Bay suburbs",
+    "waypoints": [
+      { "lat": 37.5585, "lng": -122.2711, "name": "San Mateo" },
+      { "lat": 37.5485, "lng": -122.0590, "name": "Fremont" },
+      { "lat": 37.4419, "lng": -122.1430, "name": "Palo Alto" },
+      { "lat": 37.3861, "lng": -122.0839, "name": "Mountain View" },
+      { "lat": 37.3382, "lng": -121.8863, "name": "San Jose" }
+    ]
+  },
+  "highway-route": {
+    "name": "Highway 101 Route",
+    "description": "Route along Highway 101 corridor",
+    "waypoints": [
+      { "lat": 37.7749, "lng": -122.4194, "name": "SF Start" },
+      { "lat": 37.6879, "lng": -122.4702, "name": "Daly City" },
+      { "lat": 37.6547, "lng": -122.4077, "name": "South SF" },
+      { "lat": 37.5630, "lng": -122.3255, "name": "San Mateo" },
+      { "lat": 37.4852, "lng": -122.2364, "name": "Redwood City" }
+    ]
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "name": "fleet-tracking-infra",
+  "version": "2.0.0",
+  "scripts": {
+    "build": "tsc",
+    "cdk": "cdk",
+    "synth": "cdk synth",
+    "deploy": "cdk deploy --all",
+    "test": "jest"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.260.0",
+    "constructs": "^10.6.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "@types/node": "^26.0.0",
+    "aws-cdk": "^2.1128.0",
+    "aws-jwt-verify": "^5.2.1",
+    "esbuild": "^0.28.1",
+    "jest": "^30.4.2",
+    "ts-jest": "^29.4.11",
+    "typescript": "^5.9.3"
+  },
+  "overrides": {
+    "js-yaml": "^4.2.0",
+    "babel-plugin-istanbul": "^8.0.0",
+    "glob": "^13.0.6"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "unrs-resolver@1.12.2": true,
+    "fsevents@2.3.3": true
+  }
+}

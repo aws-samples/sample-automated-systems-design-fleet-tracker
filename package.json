@@ -1,0 +1,20 @@
+{
+  "name": "fleet-tracking-platform",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Real-time GPS fleet tracking platform built on AWS IoT Core, Kinesis, Lambda, Location Service, and API Gateway",
+  "scripts": {
+    "simulator:start": "./scripts/start-simulator.sh",
+    "simulator:demo": "PUBLISH_INTERVAL=3000 ./scripts/start-simulator.sh"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "esbuild": "^0.28.1",
+    "mqtt": "^5.15.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true
+  }
+}

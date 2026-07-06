@@ -1,0 +1,47 @@
+{
+  "name": "fleet-tracking-lambdas",
+  "version": "2.0.0",
+  "private": true,
+  "scripts": {
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage"
+  },
+  "dependencies": {
+    "@aws-sdk/client-apigatewaymanagementapi": "^3.1073.0",
+    "@aws-sdk/client-cloudwatch": "^3.1073.0",
+    "@aws-sdk/client-dynamodb": "^3.1073.0",
+    "@aws-sdk/client-iot": "^3.1073.0",
+    "@aws-sdk/client-iot-data-plane": "^3.1073.0",
+    "@aws-sdk/client-location": "^3.1073.0",
+    "@aws-sdk/client-secrets-manager": "^3.1073.0",
+    "@aws-sdk/client-ses": "^3.1073.0",
+    "@aws-sdk/client-sns": "^3.1073.0",
+    "@aws-sdk/client-sqs": "^3.1073.0",
+    "@aws-sdk/client-ssm": "^3.1073.0",
+    "@aws-sdk/lib-dynamodb": "^3.1073.0",
+    "@types/mqtt": "^0.0.34",
+    "aws-jwt-verify": "^5.2.1",
+    "mqtt": "^5.15.1"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.162",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^26.0.0",
+    "aws-sdk-client-mock": "^4.1.0",
+    "fast-check": "^4.8.0",
+    "jest": "^30.4.2",
+    "ts-jest": "^29.4.11",
+    "typescript": "^5.9.3"
+  },
+  "overrides": {
+    "fast-xml-parser": "^5.7.0",
+    "js-yaml": "^4.2.0",
+    "babel-plugin-istanbul": "^8.0.0",
+    "glob": "^13.0.6"
+  },
+  "allowScripts": {
+    "unrs-resolver@1.12.2": true,
+    "fsevents@2.3.3": true
+  }
+}
