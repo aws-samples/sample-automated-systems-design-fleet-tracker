@@ -30,3 +30,6 @@ coverage/
 Thumbs.db
 *.swp
 .idea/
+
+# images
+author-tim-sitze.png
