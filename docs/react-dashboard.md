@@ -1,6 +1,6 @@
 # React Dashboard Guide
 
-The React Dashboard is a demonstration interface for testing and validating the Fleet Tracking Platform. It provides live vehicle positions, job dispatch, and basic analytics — enough to verify the system end-to-end before integrating with your own dispatch software.
+The React Dashboard is a demonstration interface for testing and validating the Fleet Tracking Platform. It provides live vehicle positions, job dispatch, and basic analytics
 
 > **Note**: This dashboard is intended for demo and testing. For production use, integrate the platform's REST and WebSocket APIs with your existing dispatch system. See the [CLI & Developer Guide](./cli-developer.md) for API details.
 
