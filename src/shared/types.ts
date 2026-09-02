@@ -12,7 +12,14 @@
 
 /**
  * GPS message published by IoT devices via MQTT
- * Topic: fleet/vehicles/{vehicleId}/gps
+ *
+ * Devices publish to two Basic Ingest reserved topics, which deliver straight to a
+ * named rule and bypass the pub/sub message broker (so neither can be subscribed to):
+ *   $aws/rules/fleet_gps_to_kinesis/fleet/vehicles/{vehicleId}/gps   -> every position
+ *   $aws/rules/fleet_gps_to_location/fleet/vehicles/{vehicleId}/gps  -> tracker path
+ *
+ * The tracker path is separate so it can be filtered independently of the DynamoDB
+ * pipeline; a rule's WHERE clause applies to the whole rule, not per action.
  */
 export interface GpsMessage {
   /** Unique vehicle identifier (e.g., "vehicle-001") */
@@ -29,6 +36,13 @@ export interface GpsMessage {
   ignition: boolean;
   /** ISO 8601 timestamp */
   timestamp: string;
+  /**
+   * Sample time as Unix epoch milliseconds.
+   *
+   * Present so the Location rule action can reference `${timestampMs}` without date
+   * parsing. Optional here because this Lambda reads `timestamp` instead.
+   */
+  timestampMs?: number;
   /** GPS accuracy in meters (used for Location Service position filtering) */
   accuracy: number;
 }

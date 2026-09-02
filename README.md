@@ -12,8 +12,8 @@ Before you begin, make sure you have the following installed and configured:
 |-------------|-------|
 | **AWS account** | With permissions to deploy IoT Core, Kinesis, DynamoDB, Lambda, Location Service, Cognito, API Gateway, CloudFront, S3, WAF, CloudWatch, SNS, and Secrets Manager. |
 | **AWS CLI v2** | Configured with credentials for target AWS account |
-| **Node.js 20.x or later** | Includes `npm`. |
-| **AWS CDK** | Invoked via `npx cdk`. The account/region must be bootstrapped once  |
+| **Node.js 20.19+ or 22.12+** | Includes `npm`. Enforced by the `engines` field in `package.json`. Node 22.x matches the `nodejs22.x` Lambda runtime the stacks deploy. |
+| **AWS CDK** | Invoked via `npx cdk` (CDK CLI is a dev dependency of `infra/`). The account/region must be bootstrapped once  |
 | **jq** | Used by the provisioning and cleanup scripts. |
 | **curl** | Used to detect your public IP for WAF allowlisting. |
 
@@ -80,10 +80,10 @@ The `cdk deploy --all` command deploys seven stacks:
 
 | Stack | What it creates |
 |-------|-----------------|
-| **FleetIoTStack** | IoT Core thing groups, device policies, topic rules |
-| **FleetIngestionStack** | Kinesis Data Stream, DynamoDB tables (vehicle state, GPS history, dispatch), GPS Processor Lambda |
+| **FleetIoTStack** | IoT Core thing group, device policy, one thing per vehicle, fleet indexing |
+| **FleetIngestionStack** | Kinesis Data Stream, `fleet_gps_to_kinesis` IoT rule, DynamoDB tables (vehicle state, GPS history, dispatch, WebSocket connections), GPS Processor and active-vehicles-counter Lambdas, two SQS dead letter queues |
 | **FleetPhase2TablesStack** | Multi-tenant tables, analytics aggregation, GSIs on core tables |
-| **FleetLocationStack** | Amazon Location Service tracker, geofence collection, geofence handler Lambda |
+| **FleetLocationStack** | Amazon Location Service tracker, geofence collection, map, place index, route calculator, `fleet_gps_to_location` IoT rule, geofence handler and email processor Lambdas |
 | **FleetMonitoringStack** | CloudWatch dashboard, alarms, SNS alerting topic |
 | **FleetApiStack** | REST API, WebSocket API, Cognito user pool, vehicle/tenant/analytics Lambdas |
 | **FleetHostingStack** | S3 bucket, CloudFront distribution, WAF rules for the demo dashboard |
@@ -114,30 +114,68 @@ aws cloudformation describe-stacks --stack-name FleetMonitoringStack \
 
 ## Architecture
 
-```
-┌─────────────────┐     ┌──────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  GPS Device     │────▶│  IoT Core    │────▶│  Kinesis Stream │────▶│  GPS Processor  │
-│  (per truck)    │MQTT │  MQTT Broker │Rule │  (buffering)    │Batch│  Lambda         │
-└─────────────────┘     └──────┬───────┘     └─────────────────┘     └────────┬────────┘
-                               │                                              │
-                               │ MQTT (job commands)                          │ writes
-                               │                                              ▼
-┌─────────────────┐     ┌──────┴───────┐                            ┌─────────────────┐
-│ Dispatch Board  │◀────│  WebSocket   │◀───────────────────────────│     DynamoDB    │
-│  (your system)  │push │  Broadcast   │        DynamoDB Stream     │(vehicle & state)│
-└────────┬────────┘     └──────────────┘                            └─────────────────┘
-         │
-         │ REST API
-         ▼
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  Vehicle API    │────▶│ Location Service│────▶│    Geofence     │
-│  (Lambda)       │     │ (tracker)       │     │   Detection     │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
+```mermaid
+flowchart TD
+    Device["GPS Device<br/>(per truck)"] -->|MQTT| IoT["AWS IoT Core<br/>Basic Ingest"]
+    IoT -->|"Rule 1"| Pipe["Kinesis Data Stream<br/>→ GPS Processor Lambda"]
+    IoT -->|"Rule 2: native Location action"| Tracker["Location Service<br/>tracker + geofence evaluation"]
+    Pipe -->|writes| DDB[("DynamoDB<br/>vehicle state & history")]
+    Tracker -->|"ENTER → Geofence Handler"| DDB
+    DDB -->|"stream → WebSocket push"| Board["Dispatch Board<br/>(your system)"]
+    Board -->|"REST"| API["Vehicle API Lambda"]
+    API -->|"job command (MQTT)"| IoT
 ```
 
-The GPS Processor Lambda performs three operations per message: upsert vehicle state, write position history, and send to Location Service for geofence evaluation. Location Service failures are isolated, DynamoDB writes always succeed regardless of tracker availability.
+The GPS Processor Lambda performs two operations per message: upsert vehicle state and write position history.
+
+Positions reach Amazon Location Service without a Lambda in the path. Devices publish to two [Basic Ingest](https://docs.aws.amazon.com/iot/latest/developerguide/iot-basic-ingest.html) topics, each handled by its own IoT rule:
+
+| Topic | Rule | Action | Receives |
+|---|---|---|---|
+| `$aws/rules/fleet_gps_to_kinesis/fleet/vehicles/<id>/gps` | `fleet_gps_to_kinesis` | Kinesis → Lambda → DynamoDB | every position |
+| `$aws/rules/fleet_gps_to_location/fleet/vehicles/<id>/gps` | `fleet_gps_to_location` | native [Location action](https://docs.aws.amazon.com/iot/latest/developerguide/location-rule-action.html) → tracker | all positions, or only those near a point of interest |
+
+Two rules rather than two actions on one rule: a rule's `WHERE` clause applies to the whole rule, so a single rule cannot send every position to DynamoDB while sending only a filtered subset to Location Service. Splitting them keeps route playback complete while letting the tracker path be filtered, which matters because Location Service bills per tracker update **and** per geofence evaluation.
+
+### Controlling Amazon Location Service cost
+
+Location Service bills per location update **and** once per linked geofence collection evaluation, so each position counts twice. Two filters stack here, in this order:
+
+**1. Native tracker filtering (primary, zero code).** The tracker is created with `positionFiltering: "DistanceBased"`, so Amazon Location ignores updates where the device moved less than 30 m — and ignored updates are neither stored nor evaluated, cutting both billed dimensions. This is one property on the tracker.
+
+Choose it deliberately, because the modes are not equivalent:
+
+| Mode | Ignored updates | Effect |
+|---|---|---|
+| `DistanceBased` | moved < 30 m | not stored, **not evaluated** — reduces both cost dimensions |
+| `AccuracyBased` | moved < measured accuracy | not stored, not evaluated — but needs accuracy data |
+| `TimeBased` (service default) | none | only thins **storage**; every update is still evaluated and billed |
+
+`AccuracyBased` is unavailable with the native Location rule action, which has no accuracy parameter. Amazon Location treats missing accuracy as zero and applies no filtering at all.
+
+The 30 m threshold is safe against the geofences here (home base 50 m, job sites 100 m) and has a reliability benefit too: it suppresses the repeated enter/exit events a parked vehicle can trigger when it jitters on a geofence edge.
+
+**2. Device-side proximity filtering (optional, additive).** Set `LOCATION_PROXIMITY_FILTER=true` on the simulator to publish to the tracker topic only when a vehicle is near its assigned job destination or home base. This is additive because it avoids the request entirely — native filtering can only act after a position has been sent. The radius (`LOCATION_PROXIMITY_RADIUS_M`, default 2000) must stay comfortably larger than the geofences being evaluated, since ENTER/EXIT events are derived from position updates and over-filtering would suppress the EXIT event.
+
+Note that distance-based savings depend on how much your fleet actually moves. At a 5-second ping, 30 m corresponds to roughly 13 mph: below that, consecutive positions fall inside the threshold and get filtered; on the highway, almost nothing is. Parked and slow-moving vehicles are where the savings come from.
 
 > **Why Kinesis between IoT Rule and Lambda?** Batching efficiency (10 records per invocation vs. 10 separate invocations), traffic spike buffering, 24-hour replay capability, partial batch failure handling, metrics captured, and support for multiple consumers on the same stream.
+
+### Partial batch failure handling
+
+By default, Lambda checkpoints a Kinesis batch only on complete success — any single bad record fails the whole batch and the entire batch is retried. [Partial batch responses](https://docs.aws.amazon.com/lambda/latest/dg/services-kinesis-batchfailurereporting.html) avoid that, and they need **both** halves wired up:
+
+1. `reportBatchItemFailures: true` on the event source mapping (`IngestionStack`)
+2. A handler that returns the failed sequence numbers (`gps-processor` returns `{ batchItemFailures: [{ itemIdentifier }] }`)
+
+Returning the payload without enabling the setting does nothing — Lambda ignores the response and still fails the whole batch.
+
+Two behaviours worth knowing:
+
+- **Successful records can be reprocessed.** Lambda checkpoints at the *lowest* returned sequence number and retries everything from there, so records after the earliest failure may be delivered twice. The GPS processor is safe here because both writes are keyed by `vehicleId` (+ `timestamp` for history), so a replay overwrites rather than duplicates. Keep any handler you add idempotent.
+- **Bisecting interacts with it.** With `bisectBatchOnError: true` also set, the batch is bisected at the returned sequence number and only the remaining records retry.
+
+Records still failing after `retryAttempts: 3` go to the `fleet-gps-processor-dlq` SQS queue.
 
 ---
 
@@ -163,13 +201,15 @@ POST /jobs
   "description": "Loading dock B, call on arrival"
 }
 
-# Response:
+# Response (201):
 {
-  "jobId": "JOB-2026-0142",
+  "jobId": "3f2a9c14-8e7b-4d51-9f0a-2c6b8d1e4a77",
   "vehicleId": "vehicle-001",
+  "address": "123 Technology Dr NW, Huntsville, AL 35805, United States",
   "coordinates": { "lat": 34.7304, "lng": -86.5861 },
   "eta": "2026-03-25T15:45:00Z",
-  "geofenceId": "job-JOB-2026-0142"
+  "distanceKm": 12.4,
+  "geofenceId": "job-3f2a9c14-8e7b-4d51-9f0a-2c6b8d1e4a77"
 }
 ```
 
@@ -189,24 +229,27 @@ ws.onmessage = (event) => {
 
 ### Vehicle status lifecycle
 
-The platform tracks vehicles through a status lifecycle with automatic transitions on geofence events:
+The platform tracks vehicles through a status lifecycle. Both automatic transitions are driven by geofence **ENTER** events — there is no EXIT-driven transition:
 
 ```
-available → en-route → on-site → returning → available
-                          ▲                     ▲
-                          │                     │
-                     Geofence ENTER       Geofence EXIT
-                     (automatic)          (automatic)
+available ──▶ en-route ──▶ returning ──▶ available
+                  ▲            ▲             ▲
+                  │            │             │
+             job assigned  job site      home base
+             (POST /jobs)  ENTER         ENTER
+                           (automatic)   (automatic)
 ```
 
-The dashboard shows simplified status badges (`available`, `moving`, `stopped`, `offline`) computed from this lifecycle plus the GPS update freshness. Dispatchers see arrival in real time without manual check-in from drivers.
+The dashboard renders the backend status directly (`available`, `en-route`, `returning`), falling back to `offline` when a vehicle has no status yet. Dispatchers see arrival in real time without manual check-in from drivers.
 
 ---
 
 ## Monitoring and alerting
 
 The `FleetMonitoringStack` creates a CloudWatch dashboard (`fleet-tracking-operations`) with:
+- Jobs completed (24h), active vehicles, and current alarm status
 - GPS message throughput and processing latency
+- Amazon Location Service tracker updates
 - Kinesis stream health and consumer lag
 - API Gateway response times and error rates
 - Lambda invocations, duration (p50/p99), errors, and throttles
@@ -236,12 +279,26 @@ See [CloudWatch Monitoring Guide](./docs/cloudwatch.md) for thresholds, custom m
 
 **Basis:** 5-second GPS updates, 10-hour days, 22 days/month (~158K messages/vehicle/month).
 
-| Configuration | 20 vehicles | 100 vehicles | Per vehicle |
-|---------------|-------------|--------------|-------------|
-| **Demo** (all positions to Location Service) | ~$236/mo | ~$1,140/mo | ~$11.40–11.80 |
-| **Production** (proximity-based geofencing) | ~$45–63/mo | ~$155–235/mo | ~$1.55–3.15 |
+| Configuration | 20 vehicles | 100 vehicles |
+|---------------|-------------|--------------|
+| **Demo** — as deployed: 5 s reporting, every position to Location Service | ~$235/mo ($11.76/vehicle) | ~$858/mo ($8.58/vehicle) |
+| **Production** — 30 s reporting, proximity filtering | ~$27/mo ($1.37/vehicle) | ~$85/mo ($0.85/vehicle) |
 
-The demo configuration sends every GPS position to Amazon Location Service, which useful for showcasing real-time arrival detection, but Location Service ends up being ~87% of the bill. Production deployments only evaluate geofences when vehicles are near active job sites, reducing Location Service costs by 80–95%.
+Amazon Location Service is ~88% of the demo bill, because it charges per tracker write **and** again per geofence evaluation. Two settings close most of the gap, in order of impact:
+
+| Change | How | Effect at 20 vehicles |
+|---|---|---|
+| Reporting interval 5 s → 30 s | `PUBLISH_INTERVAL=30000` | −78% Location Service |
+| Proximity filtering | `LOCATION_PROXIMITY_FILTER=true` | −80% of remaining Location Service |
+
+`npm run simulator:production` sets both together.
+
+The Kinesis stream already defaults to **one provisioned shard** (~$10.95/mo) rather than
+on-demand, which would bill a flat ~$29/mo regardless of volume. A shard carries 1,000
+records/sec; 100 vehicles at 5 s is 20/sec. Use `--context kinesisOnDemand=true` only if your
+traffic is genuinely spiky, or `--context kinesisShards=N` to add capacity.
+
+Note that per-vehicle cost *falls* as the fleet grows: Location Service pricing is tiered, and the Kinesis shard, alarms, and once-a-minute counter Lambda are fixed regardless of fleet size. Amazon Location Service also only bills while a vehicle is **moving** — `DistanceBased` filtering discards sub-30 m jitter, so a parked vehicle costs pipeline charges and nothing at the tracker.
 
 **Additional non-AWS costs** (not included): GPS hardware (~$60–150/unit), cellular data (~$5–15/vehicle/month), professional installation if hardwired.
 

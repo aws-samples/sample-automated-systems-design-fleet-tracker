@@ -43,14 +43,8 @@
         <mxCell id="l2" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E6;strokeColor=#ED7100;strokeWidth=2;verticalAlign=top;align=left;fontSize=15;fontStyle=1;fontColor=#C25E00;spacingLeft=12;spacingTop=8;" value="&lt;font style=&quot;font-size: 16px;&quot;&gt;&amp;nbsp; 2. Stream Processing&lt;/font&gt;" vertex="1">
           <mxGeometry height="370" width="310" x="298" y="400" as="geometry" />
         </mxCell>
-        <mxCell id="AAZzeo9LM7R7FrfTDtor-5" edge="1" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="batchNote" value="">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="374" y="627" />
-              <mxPoint x="453" y="627" />
-            </Array>
-            <mxPoint x="374" y="602.71" as="sourcePoint" />
-          </mxGeometry>
+        <mxCell id="AAZzeo9LM7R7FrfTDtor-5" edge="1" parent="1" source="kds" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="batchNote" value="">
+          <mxGeometry relative="1" as="geometry" />
         </mxCell>
         <mxCell id="kds" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;gradientColor=none;fillColor=#8C4FFF;strokeColor=none;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=13;fontStyle=0;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.kinesis_data_streams;" value="&lt;font style=&quot;font-size: 16px;&quot;&gt;Amazon Kinesis&lt;br&gt;Data Streams&lt;/font&gt;" vertex="1">
           <mxGeometry height="78" width="78" x="335" y="480" as="geometry" />

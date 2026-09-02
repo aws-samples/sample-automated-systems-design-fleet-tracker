@@ -1,6 +1,7 @@
 import * as cdk from "aws-cdk-lib";
 import * as path from "path";
 import * as location from "aws-cdk-lib/aws-location";
+import * as iot from "aws-cdk-lib/aws-iot";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as lambdaNode from "aws-cdk-lib/aws-lambda-nodejs";
 import * as events from "aws-cdk-lib/aws-events";
@@ -78,10 +79,31 @@ export class LocationStack extends cdk.Stack {
 
     const { dispatchTable, vehicleStateTable, connectionsTable, websocketEndpoint, emailSubscriptionsTable, sesFromEmail } = props;
 
-    // Tracker for vehicle position updates with 5s time-based filtering
+    // Tracker for vehicle position updates.
+    //
+    // DistanceBased is the primary cost control here and it costs nothing to enable.
+    // Amazon Location ignores an update when the device has moved less than 30 m, and
+    // ignored updates are neither stored NOR evaluated against linked geofence
+    // collections. Since billing is per location update plus one per geofence
+    // collection evaluation, that cuts both dimensions.
+    //
+    // TimeBased (the service default, and what this stack used previously) would be the
+    // wrong choice: it only reduces what is STORED. Every update is still evaluated and
+    // still billed. Per the AWS docs, 5-second pings under TimeBased bill 720 location
+    // updates and 1,440 geofence evaluations per hour per device with two collections.
+    //
+    // AccuracyBased is not an option for us: the native `location` IoT rule action has
+    // no accuracy parameter (only deviceId, latitude, longitude, timestamp, trackerName
+    // and roleArn), and Amazon Location treats missing accuracy as zero, which disables
+    // filtering entirely.
+    //
+    // The 30 m threshold is safe against our geofences: home base is 50 m radius and job
+    // sites are 100 m, so an approaching vehicle still registers positions inside the
+    // boundary. It also suppresses the enter/exit "bouncing" the docs warn about when a
+    // parked vehicle jitters on a geofence edge.
     this.tracker = new location.CfnTracker(this, "FleetTracker", {
       trackerName: FLEET_TRACKER_NAME,
-      positionFiltering: "TimeBased",
+      positionFiltering: "DistanceBased",
     });
     this.trackerName = FLEET_TRACKER_NAME;
 
@@ -153,8 +175,72 @@ export class LocationStack extends cdk.Stack {
     });
 
     // Ensure TrackerConsumer is created after both tracker and geofence collection
-    trackerConsumer.addDependency(this.tracker);
-    trackerConsumer.addDependency(this.geofenceCollection);
+    trackerConsumer.addResourceDependency(this.tracker);
+    trackerConsumer.addResourceDependency(this.geofenceCollection);
+
+    // =========================================================================
+    // IoT Rule: GPS positions -> Location Service tracker (no Lambda in this path)
+    //
+    // Devices publish to a dedicated Basic Ingest topic for this rule:
+    //   $aws/rules/fleet_gps_to_location/fleet/vehicles/<vehicleId>/gps
+    //
+    // Why a second rule instead of a second action on the ingestion rule: a rule's
+    // WHERE clause applies to the entire rule, so one rule cannot send every position
+    // to DynamoDB while sending only a filtered subset to Location Service. Keeping
+    // them separate lets the DynamoDB pipeline stay complete (route playback needs
+    // every point) while this path can be filtered to cut tracker and geofence
+    // evaluation charges. The simulator's LOCATION_PROXIMITY_FILTER toggle decides
+    // which positions reach this topic.
+    // =========================================================================
+    const iotLocationRole = new iam.Role(this, "IoTLocationRole", {
+      assumedBy: new iam.ServicePrincipal("iot.amazonaws.com"),
+      description: "Allows IoT Rules to write device positions to the Location tracker",
+    });
+
+    iotLocationRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ["geo:BatchUpdateDevicePosition"],
+        resources: [
+          `arn:aws:geo:${this.region}:${this.account}:tracker/${this.trackerName}`,
+        ],
+      })
+    );
+
+    const gpsToLocationRule = new iot.CfnTopicRule(this, "GpsToLocationRule", {
+      ruleName: "fleet_gps_to_location",
+      topicRulePayload: {
+        description:
+          "Write vehicle GPS positions directly to the Amazon Location Service tracker",
+        // IoT strips the $aws/rules/<rule-name> prefix before SQL evaluation, so this
+        // filter matches the fleet/vehicles/<vehicleId>/gps suffix of the topic.
+        sql: "SELECT * FROM 'fleet/vehicles/+/gps'",
+        awsIotSqlVersion: "2016-03-23",
+        actions: [
+          {
+            location: {
+              roleArn: iotLocationRole.roleArn,
+              trackerName: this.trackerName,
+              deviceId: "${vehicleId}",
+              latitude: "${lat}",
+              longitude: "${lng}",
+              // The device sends epoch millis so the rule needs no date parsing.
+              // Hardware emitting only ISO-8601 can use
+              // time_to_epoch(timestamp, '<JDK11 pattern>') instead. Leaving this out
+              // defaults to message-processing time, which misdates any position that
+              // was buffered on the device during a connectivity gap.
+              timestamp: {
+                value: "${timestampMs}",
+                unit: "MILLISECONDS",
+              },
+            },
+          },
+        ],
+        ruleDisabled: false,
+      },
+    });
+
+    // The tracker must exist before the rule can write to it
+    gpsToLocationRule.addResourceDependency(this.tracker);
 
     // SQS Dead Letter Queue for failed SNS deliveries (Requirement 3.1)
     this.jobCompletionDlq = new sqs.Queue(this, "JobCompletionDLQ", {

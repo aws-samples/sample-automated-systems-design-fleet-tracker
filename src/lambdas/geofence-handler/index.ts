@@ -249,6 +249,53 @@ async function emitJobCompletionMetric(vehicleId: string, tenantId?: string): Pr
   }
 }
 
+/**
+ * Emit a count of geofence events received, for the FleetTracking/GeofenceEvents metric.
+ *
+ * Dimensions are deliberately BOUNDED. GeofenceId is not a dimension: job-site
+ * geofences are named `job-<uuid>` and are created and deleted per job, so using it
+ * would mint a brand-new custom metric on every dispatch. CloudWatch bills per unique
+ * dimension combination, so at ~4 jobs/vehicle/day across 20 vehicles that is roughly
+ * 1,760 new custom metrics a month — more than the rest of the platform combined.
+ * GeofenceType ("home" | "job") gives the same operational signal at fixed cardinality;
+ * the specific geofence ID is already on every log line if you need to trace one event.
+ *
+ * Only ENTER reaches this handler (the EventBridge rule in LocationStack filters to
+ * ENTER), so EventType is currently always "ENTER". It stays a dimension so adding an
+ * EXIT rule later does not require a metric change.
+ */
+async function emitGeofenceEventMetric(
+  eventType: string,
+  geofenceType: "home" | "job"
+): Promise<void> {
+  try {
+    await cloudWatchClient.send(new PutMetricDataCommand({
+      Namespace: "FleetTracking",
+      MetricData: [
+        {
+          MetricName: "GeofenceEvents",
+          Value: 1,
+          Unit: "Count",
+          Dimensions: [
+            { Name: "EventType", Value: eventType },
+            { Name: "GeofenceType", Value: geofenceType },
+          ],
+        },
+        // Dimensionless copy for dashboard aggregation, matching JobsCompleted.
+        {
+          MetricName: "GeofenceEvents",
+          Value: 1,
+          Unit: "Count",
+        },
+      ],
+    }));
+  } catch (error: unknown) {
+    const err = error as { message?: string };
+    log("WARN", "Failed to emit geofence event metric", { errorMessage: err.message });
+    // Don't throw - metrics are non-critical
+  }
+}
+
 async function broadcastJobCompletion(jobId: string, vehicleId: string, completedAt: string): Promise<void> {
   if (!WEBSOCKET_ENDPOINT || !CONNECTIONS_TABLE) {
     log("WARN", "WebSocket broadcast skipped - endpoint or connections table not configured");
@@ -424,6 +471,7 @@ export const handler = async (
   try {
     // Check if this is a home base geofence (Requirement 4.4-4.6)
     if (isHomeBaseGeofence(GeofenceId)) {
+      await emitGeofenceEventMetric(EventType, "home");
       const homeVehicleId = extractVehicleIdFromHomeBase(GeofenceId);
       if (homeVehicleId && homeVehicleId === vehicleId) {
         await handleHomeBaseReturn(vehicleId, GeofenceId, requestId);
@@ -441,6 +489,7 @@ export const handler = async (
     // Check if this is a job geofence (Requirement 1.1-1.5)
     const jobId = extractJobId(GeofenceId);
     if (jobId) {
+      await emitGeofenceEventMetric(EventType, "job");
       await handleJobCompletion(jobId, vehicleId, GeofenceId, completedAt, requestId);
       return;
     }

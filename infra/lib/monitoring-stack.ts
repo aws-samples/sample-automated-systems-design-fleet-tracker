@@ -261,19 +261,126 @@ export class MonitoringStack extends cdk.Stack {
         width: 8,
         height: 6,
       }),
+      // Location Service bills on TWO dimensions, so both are plotted here.
+      //
+      // Note what CallCount actually measures: API invocations, not billable stored
+      // positions. The fleet_gps_to_location IoT rule calls BatchUpdateDevicePosition
+      // once per message, but the tracker's DistanceBased filtering then discards any
+      // update under 30 m, and discarded updates are neither stored nor evaluated. So
+      // BatchUpdateDevicePosition tracks message volume while BatchEvaluateGeofences
+      // tracks how much the fleet actually moved. A parked fleet produces a large gap
+      // between the two lines — that gap is the saving DistanceBased is delivering.
       new cloudwatch.GraphWidget({
-        title: "Location Service Updates",
+        title: "Location Service (both billed dimensions)",
         left: [
-          new cloudwatch.Metric({ 
-            namespace: "AWS/Location", 
-            metricName: "CallCount", 
-            dimensionsMap: { 
+          new cloudwatch.Metric({
+            namespace: "AWS/Location",
+            metricName: "CallCount",
+            dimensionsMap: {
               OperationName: "BatchUpdateDevicePosition",
               ResourceName: "fleet-tracker",
-            }, 
-            statistic: "Sum", 
+            },
+            statistic: "Sum",
             period: cdk.Duration.minutes(1),
-            label: "Position Updates",
+            label: "Tracker API calls",
+          }),
+          new cloudwatch.Metric({
+            namespace: "AWS/Location",
+            metricName: "CallCount",
+            dimensionsMap: {
+              OperationName: "BatchEvaluateGeofences",
+            },
+            statistic: "Sum",
+            period: cdk.Duration.minutes(1),
+            label: "Geofence evaluations (post-filter)",
+          }),
+        ],
+        width: 8,
+        height: 6,
+      })
+    );
+
+    // =========================================================================
+    // Row 2b: IoT Core rule health
+    //
+    // The ingestion path starts at the IoT rules engine, so rule-action failures are
+    // the earliest signal that positions are being dropped. Without this, an action
+    // failure is only visible indirectly via the DLQ alarm.
+    // =========================================================================
+    dashboard.addWidgets(
+      new cloudwatch.GraphWidget({
+        title: "IoT Rule Matches",
+        left: [
+          new cloudwatch.Metric({
+            namespace: "AWS/IoT",
+            metricName: "TopicMatch",
+            dimensionsMap: { RuleName: "fleet_gps_to_kinesis" },
+            statistic: "Sum",
+            period: cdk.Duration.minutes(1),
+            label: "fleet_gps_to_kinesis",
+          }),
+          new cloudwatch.Metric({
+            namespace: "AWS/IoT",
+            metricName: "TopicMatch",
+            dimensionsMap: { RuleName: "fleet_gps_to_location" },
+            statistic: "Sum",
+            period: cdk.Duration.minutes(1),
+            label: "fleet_gps_to_location",
+          }),
+        ],
+        width: 8,
+        height: 6,
+      }),
+      new cloudwatch.GraphWidget({
+        title: "IoT Rule Action Success / Failure",
+        left: [
+          new cloudwatch.Metric({
+            namespace: "AWS/IoT",
+            metricName: "Success",
+            dimensionsMap: { ActionType: "Kinesis", RuleName: "fleet_gps_to_kinesis" },
+            statistic: "Sum",
+            period: cdk.Duration.minutes(1),
+            label: "Kinesis action success",
+          }),
+          new cloudwatch.Metric({
+            namespace: "AWS/IoT",
+            metricName: "Success",
+            dimensionsMap: { ActionType: "Location", RuleName: "fleet_gps_to_location" },
+            statistic: "Sum",
+            period: cdk.Duration.minutes(1),
+            label: "Location action success",
+          }),
+        ],
+        right: [
+          new cloudwatch.Metric({
+            namespace: "AWS/IoT",
+            metricName: "Failure",
+            dimensionsMap: { ActionType: "Kinesis", RuleName: "fleet_gps_to_kinesis" },
+            statistic: "Sum",
+            period: cdk.Duration.minutes(1),
+            label: "Kinesis action FAILURE",
+          }),
+          new cloudwatch.Metric({
+            namespace: "AWS/IoT",
+            metricName: "Failure",
+            dimensionsMap: { ActionType: "Location", RuleName: "fleet_gps_to_location" },
+            statistic: "Sum",
+            period: cdk.Duration.minutes(1),
+            label: "Location action FAILURE",
+          }),
+        ],
+        width: 8,
+        height: 6,
+      }),
+      new cloudwatch.GraphWidget({
+        title: "Geofence Events",
+        left: [
+          new cloudwatch.Metric({
+            namespace: "FleetTracking",
+            metricName: "GeofenceEvents",
+            statistic: "Sum",
+            period: cdk.Duration.minutes(5),
+            label: "ENTER events (all geofences)",
           }),
         ],
         width: 8,

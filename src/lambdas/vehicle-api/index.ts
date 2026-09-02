@@ -63,6 +63,12 @@ const EMAIL_SUBSCRIPTIONS_TABLE = process.env.EMAIL_SUBSCRIPTIONS_TABLE;
 // Geofence radius in meters for job sites
 const JOB_SITE_GEOFENCE_RADIUS = 100;
 
+// Bounds for GET /vehicles/{id}/history?hours=N.
+// The gps-history table carries a 24-hour TTL, so a window wider than 24 hours can
+// never return additional data — it would only widen the DynamoDB range read.
+const DEFAULT_HISTORY_HOURS = 24;
+const MAX_HISTORY_HOURS = 24;
+
 /**
  * Main Lambda handler - routes requests to appropriate handlers
  */
@@ -94,9 +100,22 @@ export const handler = async (
 
     // Route: GET /vehicles/{id}/history
     if (httpMethod === "GET" && path.match(/^\/vehicles\/[^/]+\/history$/) && pathParameters?.id) {
-      const hours = event.queryStringParameters?.hours
-        ? parseInt(event.queryStringParameters.hours, 10)
-        : 24;
+      const rawHours = event.queryStringParameters?.hours;
+      let hours = DEFAULT_HISTORY_HOURS;
+
+      if (rawHours !== undefined) {
+        // Reject rather than coerce: parseInt("abc") yields NaN, which previously
+        // produced an Invalid Date and surfaced as a 500.
+        const parsed = Number(rawHours);
+        if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 1) {
+          return response(400, {
+            error: "Bad Request",
+            message: "hours must be a positive integer",
+          });
+        }
+        hours = Math.min(parsed, MAX_HISTORY_HOURS);
+      }
+
       return await getVehicleHistory(pathParameters.id, hours, tenantId);
     }
 
@@ -242,7 +261,7 @@ async function getVehicle(vehicleId: string, tenantId: string): Promise<APIGatew
  */
 async function getVehicleHistory(
   vehicleId: string,
-  hours: number = 24,
+  hours: number = DEFAULT_HISTORY_HOURS,
   tenantId: string
 ): Promise<APIGatewayProxyResult> {
   // First verify tenant access to this vehicle

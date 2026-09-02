@@ -5,7 +5,11 @@ export interface Vehicle {
   longitude: number;
   speed: number;
   heading: number;
-  status: "moving" | "stopped" | "offline" | "available" | "en-route" | "on-site" | "returning" | "idle";
+  // Mirrors VehicleStatus in src/shared/types.ts. The backend only ever writes
+  // "available", "en-route", and "returning"; "offline" is the dashboard's fallback
+  // when a vehicle has no status yet. "on-site" and "idle" are declared by the
+  // backend union but not currently written by any handler.
+  status: "available" | "en-route" | "on-site" | "returning" | "offline" | "idle";
   lastUpdate: string;
   assignedJob?: string;
   technician?: string;

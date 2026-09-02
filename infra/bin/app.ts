@@ -68,7 +68,7 @@ const ingestionStack = new IngestionStack(app, "FleetIngestionStack", {
   env,
   description: "Fleet tracking data ingestion - Kinesis, DynamoDB, Lambda processors, IoT Rules",
 });
-ingestionStack.addDependency(iotStack);
+ingestionStack.addStackDependency(iotStack);
 
 // 3. Phase 2 Tables Stack - New DynamoDB tables and GSIs for multi-tenant and analytics
 const phase2TablesStack = new Phase2TablesStack(app, "FleetPhase2TablesStack", {
@@ -78,7 +78,7 @@ const phase2TablesStack = new Phase2TablesStack(app, "FleetPhase2TablesStack", {
   websocketConnectionsTable: ingestionStack.websocketConnectionsTable,
   description: "Fleet tracking Phase 2 - Multi-tenant tables and analytics",
 });
-phase2TablesStack.addDependency(ingestionStack);
+phase2TablesStack.addStackDependency(ingestionStack);
 
 // 4. Location Stack - Tracker, Geofences, Maps, Routes, EventBridge rule for geofence events
 const locationStack = new LocationStack(app, "FleetLocationStack", {
@@ -89,8 +89,8 @@ const locationStack = new LocationStack(app, "FleetLocationStack", {
   emailSubscriptionsTable: phase2TablesStack.emailSubscriptionsTable,
   description: "Fleet tracking Location Service - Tracker, Geofences, Maps, Routes, Geofence Handler",
 });
-locationStack.addDependency(ingestionStack);
-locationStack.addDependency(phase2TablesStack);
+locationStack.addStackDependency(ingestionStack);
+locationStack.addStackDependency(phase2TablesStack);
 
 // 5. API Stack - REST API, WebSocket API, Cognito, WAF, Lambdas
 //    Created before MonitoringStack so its WebSocket API can be referenced for metrics.
@@ -112,9 +112,9 @@ const apiStack = new ApiStack(app, "FleetApiStack", {
   analyticsDailyTable: phase2TablesStack.analyticsDailyTable,
   description: "Fleet tracking APIs - REST, WebSocket, Cognito, Tenant and Analytics Lambdas",
 });
-apiStack.addDependency(ingestionStack);
-apiStack.addDependency(locationStack);
-apiStack.addDependency(phase2TablesStack);
+apiStack.addStackDependency(ingestionStack);
+apiStack.addStackDependency(locationStack);
+apiStack.addStackDependency(phase2TablesStack);
 
 // 6. Monitoring Stack - CloudWatch dashboards, alarms, SNS topic
 //    Receives the WebSocket API from ApiStack for connection metrics.
@@ -123,10 +123,10 @@ const monitoringStack = new MonitoringStack(app, "FleetMonitoringStack", {
   webSocketApi: apiStack.webSocketApi,
   description: "Fleet tracking monitoring - CloudWatch dashboards and alarms",
 });
-monitoringStack.addDependency(iotStack);
-monitoringStack.addDependency(ingestionStack);
-monitoringStack.addDependency(locationStack);
-monitoringStack.addDependency(apiStack);
+monitoringStack.addStackDependency(iotStack);
+monitoringStack.addStackDependency(ingestionStack);
+monitoringStack.addStackDependency(locationStack);
+monitoringStack.addStackDependency(apiStack);
 
 // 7. Hosting Stack - S3, CloudFront, WAF with IP allowlist
 const hostingStack = new HostingStack(app, "FleetHostingStack", {
@@ -140,7 +140,7 @@ const hostingStack = new HostingStack(app, "FleetHostingStack", {
   identityPoolId: apiStack.identityPool.ref,
   description: "Fleet tracking dashboard hosting - S3, CloudFront, WAF",
 });
-hostingStack.addDependency(apiStack);
+hostingStack.addStackDependency(apiStack);
 
 // Add tags to all stacks for resource identification
 cdk.Tags.of(app).add("Project", "FleetTracking");

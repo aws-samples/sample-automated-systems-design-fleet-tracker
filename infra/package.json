@@ -9,17 +9,17 @@
     "test": "jest"
   },
   "dependencies": {
-    "aws-cdk-lib": "^2.260.0",
-    "constructs": "^10.6.0"
+    "aws-cdk-lib": "^2.267.0",
+    "constructs": "^10.8.1"
   },
   "devDependencies": {
     "@types/jest": "^30.0.0",
-    "@types/node": "^26.0.0",
-    "aws-cdk": "^2.1128.0",
+    "@types/node": "^26.4.1",
+    "aws-cdk": "^2.1139.0",
     "aws-jwt-verify": "^5.2.1",
-    "esbuild": "^0.28.1",
-    "jest": "^30.4.2",
-    "ts-jest": "^29.4.11",
+    "esbuild": "^0.28.2",
+    "jest": "^30.5.1",
+    "ts-jest": "^29.4.12",
     "typescript": "^5.9.3"
   },
   "overrides": {
@@ -28,8 +28,9 @@
     "glob": "^13.0.6"
   },
   "allowScripts": {
-    "esbuild@0.28.1": true,
-    "unrs-resolver@1.12.2": true,
-    "fsevents@2.3.3": true
+    "esbuild": true,
+    "unrs-resolver": true,
+    "fsevents": true,
+    "@parcel/watcher": false
   }
 }

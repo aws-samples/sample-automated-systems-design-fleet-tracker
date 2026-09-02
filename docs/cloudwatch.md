@@ -23,7 +23,7 @@ The dashboard is named `fleet-tracking-operations`.
 
 | Widget | Metric | Purpose |
 |--------|--------|---------|
-| Jobs Completed (24h) | `FleetTracking/JobsCompleted` | Track delivery completions |
+| Jobs Completed (24h) | `FleetTracking/JobsCompleted` | Track delivery completions. Blank until a job actually completes — CloudWatch renders no value rather than `0` for a metric with no datapoints, so a fresh deployment shows an empty tile. |
 | Active Vehicles | `FleetTracking/ActiveVehicles` | Vehicles reporting GPS in the last 5 minutes |
 | GPS Updates/min | `AWS/Kinesis/IncomingRecords` | Data ingestion rate |
 | Alarm Status | Composite of all 6 alarms | Quick health check |
@@ -34,7 +34,21 @@ The dashboard is named `fleet-tracking-operations`.
 |--------|---------|---------|
 | Kinesis Ingestion Rate | Kinesis IncomingRecords | GPS data volume |
 | Kinesis Stream Health | IncomingRecords, GetRecords, IteratorAge | Stream processing health |
-| Location Service Updates | AWS/Location CallCount | Position update frequency |
+| Location Service (both billed dimensions) | `AWS/Location` CallCount for `BatchUpdateDevicePosition` and `BatchEvaluateGeofences` | Both charged dimensions on one axis |
+
+**Reading the Location Service widget.** `CallCount` measures **API invocations, not billable stored positions**. The `fleet_gps_to_location` rule calls `BatchUpdateDevicePosition` once per message, then the tracker's `DistanceBased` filtering discards any update under 30 m — and discarded updates are neither stored nor evaluated. So the two lines answer different questions: tracker API calls track *message volume*, geofence evaluations track *how much the fleet actually moved*.
+
+Expect a large gap between them whenever vehicles are parked. In one 65-minute sample with four of five vehicles stationary and the fifth covering roughly 270 m, this deployment recorded **2,105 tracker API calls against 12 geofence evaluations** — the gap is the saving `DistanceBased` is delivering. Do not read the tracker-API-call line as a billable-position count.
+
+### Row 2b: IoT Core rule health
+
+The ingestion path begins at the IoT rules engine, so rule-action failures are the earliest signal that positions are being dropped.
+
+| Widget | Metrics | Purpose |
+|--------|---------|---------|
+| IoT Rule Matches | `AWS/IoT` TopicMatch per `RuleName` | Confirms both Basic Ingest rules are receiving messages |
+| IoT Rule Action Success / Failure | `AWS/IoT` Success and Failure per `ActionType` + `RuleName` | Catches Kinesis or Location action failures directly, rather than inferring them from DLQ depth |
+| Geofence Events | `FleetTracking/GeofenceEvents` | ENTER events across all geofences |
 
 ### Row 3: Lambda performance (Fleet-scoped via SEARCH)
 
@@ -160,9 +174,11 @@ The platform emits custom metrics to the `FleetTracking` namespace:
 |--------|-------------|-----------|------------|
 | `JobsCompleted` | Delivery job completions | `geofence-handler` Lambda on geofence ENTER | TenantId, VehicleId (and dimensionless aggregate) |
 | `ActiveVehicles` | Vehicles reporting GPS in the last 5 minutes | `active-vehicles-counter` Lambda on a 1-minute schedule | None |
-| `GeofenceEvents` | Entry/exit events | `geofence-handler` Lambda | EventType, GeofenceId |
+| `GeofenceEvents` | Geofence events received | `geofence-handler` Lambda | EventType, GeofenceType (and dimensionless aggregate) |
 
 A second namespace, `FleetTracking/Analytics`, is emitted by the `analytics-aggregator` Lambda for `JobsProcessed` and `AggregationDuration`.
+
+**On `GeofenceEvents` dimensions.** `GeofenceType` is `home` or `job`. The geofence ID is deliberately *not* a dimension: job-site geofences are named `job-<uuid>` and created per dispatch, so using the ID would mint a new custom metric on every job — roughly 1,760/month for a 20-vehicle fleet at 4 jobs/vehicle/day, since CloudWatch bills per unique dimension combination. Use the structured logs to trace an individual geofence event. `EventType` is currently always `ENTER`, because the `fleet-geofence-enter` EventBridge rule filters to ENTER; the dimension exists so adding EXIT later needs no metric change.
 
 ### Querying custom metrics
 
@@ -196,6 +212,10 @@ aws cloudwatch get-metric-statistics \
 1. **Check Lambda logs** — verify the emitting Lambda is running and the `PutMetricData` call succeeds
 2. **Verify IAM permissions** — emitting Lambdas need `cloudwatch:PutMetricData` (scoped to the `FleetTracking` namespace)
 3. **Wait for propagation** — new metrics can take 1–2 minutes to appear in the dashboard
+
+## Optional: richer visualization
+
+Nothing in this repository deploys a Grafana workspace or imports a dashboard definition. If the CloudWatch dashboard isn't enough, Amazon Managed Grafana reads the same metrics with no changes to the fleet stacks — create a workspace per the [AWS getting-started guide](https://docs.aws.amazon.com/grafana/latest/userguide/getting-started-with-AMG.html) and add [CloudWatch as a data source](https://docs.aws.amazon.com/grafana/latest/userguide/using-amazon-cloudwatch-in-AMG.html). Billing is per active user and is not included in the cost figures in [Other Considerations](./other-considerations.md).
 
 ## Best practices
 

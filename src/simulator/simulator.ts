@@ -4,6 +4,40 @@ import * as path from "path";
 import { LocationClient, CalculateRouteCommand } from "@aws-sdk/client-location";
 import type { VehicleConfig } from "./vehicle-config";
 
+/**
+ * Name of the IoT rule that ingests GPS positions (IngestionStack -> GpsToKinesisRule).
+ * Devices publish to the Basic Ingest reserved topic `$aws/rules/<rule-name>/...`, which
+ * delivers straight to this rule and bypasses the pub/sub message broker.
+ */
+const GPS_INGEST_RULE_NAME = process.env.GPS_INGEST_RULE_NAME ?? "fleet_gps_to_kinesis";
+
+/**
+ * Name of the IoT rule that forwards positions to the Amazon Location Service
+ * tracker via the native `location` rule action (LocationStack -> GpsToLocationRule).
+ *
+ * This is a SECOND rule, not a second action on the ingestion rule, because a rule's
+ * WHERE clause applies to the whole rule. One rule cannot send every position to
+ * DynamoDB while sending only a subset to Location Service.
+ */
+const GPS_LOCATION_RULE_NAME =
+  process.env.GPS_LOCATION_RULE_NAME ?? "fleet_gps_to_location";
+
+/**
+ * Proximity filtering (off by default so the demo shows the full capability).
+ *
+ * Amazon Location bills per tracker position update AND per geofence evaluation, so
+ * publishing every position to the tracker is the dominant cost at scale. With this
+ * enabled, positions only go to the tracker when the vehicle is near a point of
+ * interest — its assigned job destination or its home base.
+ *
+ * IMPORTANT: the radius must be comfortably LARGER than the geofences being
+ * evaluated. Geofence ENTER/EXIT events are derived from position updates, so if we
+ * stopped publishing the moment a vehicle left a geofence, the EXIT event would never
+ * fire. A wide radius keeps publishing while the vehicle drives away.
+ */
+const PROXIMITY_FILTER_ENABLED = process.env.LOCATION_PROXIMITY_FILTER === "true";
+const PROXIMITY_RADIUS_M = Number(process.env.LOCATION_PROXIMITY_RADIUS_M ?? 2000);
+
 export interface SimulatorOptions {
   iotEndpoint: string;
   certPath: string;
@@ -18,6 +52,17 @@ export interface SimulatorOptions {
 export interface GpsMessage {
   vehicleId: string;
   timestamp: string;
+  /**
+   * Sample time as Unix epoch milliseconds.
+   *
+   * The Location rule action needs an epoch value for its `timestamp` parameter, and
+   * sending it in the payload lets the rule reference `${timestampMs}` directly.
+   * Hardware that only emits ISO-8601 can convert in the rule instead with
+   * `time_to_epoch(timestamp, '<pattern>')`, which takes a JDK11 DateTimeFormatter
+   * pattern. Omitting the parameter entirely would fall back to message-processing
+   * time, which is wrong for positions buffered during a connectivity dead zone.
+   */
+  timestampMs: number;
   lat: number;
   lng: number;
   speed: number;
@@ -81,6 +126,9 @@ export class VehicleSimulator {
   private routePoints: RoutePoint[] = [];
   private currentRouteIndex = 0;
   private state: VehicleState = "available";
+  // Destination of the active job, retained so proximity filtering can be evaluated
+  // on-device without any server-side lookup.
+  private destination: RoutePoint | null = null;
 
   constructor(
     private vehicle: VehicleConfig,
@@ -99,6 +147,14 @@ export class VehicleSimulator {
   async start(): Promise<void> {
     const certDir = path.join(this.options.certPath, this.vehicle.vehicleId);
 
+    // Dead-zone behavior is a client-side concern, not something the broker provides.
+    // We rely on mqtt.js defaults here: reconnectPeriod (1s) drives automatic
+    // reconnection, and unacknowledged QoS 1 publishes are held in an in-memory store
+    // and resent on reconnect. That store does NOT survive a process restart, so this
+    // simulator drops positions across a restart. Real GPS hardware should buffer to
+    // persistent local storage instead. Note IoT Core persistent sessions would not
+    // help: they queue QoS 1 messages sent TO a subscribed device, not telemetry
+    // published FROM one.
     this.client = mqtt.connect({
       host: this.options.iotEndpoint,
       port: 8883,
@@ -157,6 +213,7 @@ export class VehicleSimulator {
       if (command.action === "ASSIGN" && command.destination) {
         this.currentJobId = command.jobId;
         this.state = "en-route";
+        this.destination = { lat: command.destination.lat, lng: command.destination.lng };
         console.log(`[${this.vehicle.vehicleId}] Job assigned: ${command.jobId}, calculating route to ${command.destination.address}`);
         
         // Calculate route to destination
@@ -170,6 +227,7 @@ export class VehicleSimulator {
         this.routePoints = [];
         this.currentRouteIndex = 0;
         this.state = "available";
+        this.destination = null;
         console.log(`[${this.vehicle.vehicleId}] Job cancelled`);
       }
     } catch (err) {
@@ -305,12 +363,15 @@ export class VehicleSimulator {
     const timestamp = new Date().toISOString();
     const lat = this.currentLat + jitter();
     const lng = this.currentLng + jitter();
-    const actualSpeed = speed + (Math.random() - 0.5) * 2;
+    // Jitter only while moving, and never report a negative speed. Applying ±1 mph
+    // jitter to a parked vehicle's 0 mph produced "-1 mph" / "-0 mph" in the dashboard.
+    const actualSpeed = isMoving ? Math.max(0, speed + (Math.random() - 0.5) * 2) : 0;
     const roundedHeading = Math.round(heading);
 
     const message: GpsMessage = {
       vehicleId: this.vehicle.vehicleId,
       timestamp,
+      timestampMs: Date.parse(timestamp),
       lat,
       lng,
       speed: actualSpeed,
@@ -320,8 +381,26 @@ export class VehicleSimulator {
       status: this.state, // Include status for dashboard
     };
 
-    const topic = `fleet/vehicles/${this.vehicle.vehicleId}/gps`;
-    this.client.publish(topic, JSON.stringify(message), { qos: 1 });
+    // Basic Ingest reserved topic: invokes the ingestion rule directly and bypasses the
+    // pub/sub message broker, which removes IoT Core messaging charges on this high-volume
+    // path. IoT strips the `$aws/rules/<rule-name>` prefix before SQL evaluation, so the
+    // rule's `FROM 'fleet/vehicles/+/gps'` filter and topic(3) resolve exactly as before.
+    // Basic Ingest topics are publish-only, so command/control and Device Shadow updates
+    // stay on standard broker topics.
+    const topic = `$aws/rules/${GPS_INGEST_RULE_NAME}/fleet/vehicles/${this.vehicle.vehicleId}/gps`;
+    // QoS 1 PUBACK confirms delivery to the rules engine, not that the Kinesis action
+    // succeeded. The rule's SQS error action captures downstream failures.
+    const payload = JSON.stringify(message);
+    this.client.publish(topic, payload, { qos: 1 });
+
+    // Second Basic Ingest topic, handled by its own rule, which writes straight to the
+    // Location Service tracker via the native `location` action - no Lambda involved.
+    // Publishing to both topics is free: Basic Ingest reserved topics incur no
+    // messaging charges.
+    if (!PROXIMITY_FILTER_ENABLED || this.isNearPointOfInterest(lat, lng)) {
+      const locationTopic = `$aws/rules/${GPS_LOCATION_RULE_NAME}/fleet/vehicles/${this.vehicle.vehicleId}/gps`;
+      this.client.publish(locationTopic, payload, { qos: 1 });
+    }
 
     // Task 11.6: Update Device Shadow when publishing GPS data
     // Requirements: 9.3 - Update Device Shadow with reported state
@@ -360,6 +439,36 @@ export class VehicleSimulator {
 
     const shadowTopic = `$aws/things/${this.vehicle.vehicleId}/shadow/update`;
     this.client.publish(shadowTopic, JSON.stringify(shadowUpdate), { qos: 1 });
+  }
+
+  /**
+   * True when the vehicle is close enough to a geofenced point of interest that its
+   * positions are worth evaluating.
+   *
+   * Both the active job destination and the home base are included. Home base has its
+   * own geofence in this demo, so filtering on the job destination alone would silently
+   * drop home-base ENTER/EXIT events.
+   *
+   * The device can answer this itself because the dispatch command already told it the
+   * destination — no DynamoDB lookup and no Lambda required. Doing the same check
+   * server-side would mean `get_dynamodb()` in the rule's WHERE clause, which is billed
+   * per message like a rule action and is limited to one call per statement.
+   */
+  private isNearPointOfInterest(lat: number, lng: number): boolean {
+    const radiusKm = PROXIMITY_RADIUS_M / 1000;
+
+    if (this.haversineDistance(lat, lng, this.startLat, this.startLng) <= radiusKm) {
+      return true;
+    }
+
+    if (
+      this.destination &&
+      this.haversineDistance(lat, lng, this.destination.lat, this.destination.lng) <= radiusKm
+    ) {
+      return true;
+    }
+
+    return false;
   }
 
   private haversineDistance(lat1: number, lng1: number, lat2: number, lng2: number): number {

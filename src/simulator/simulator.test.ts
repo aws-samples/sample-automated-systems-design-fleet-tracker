@@ -49,9 +49,11 @@ describe("Vehicle Configuration", () => {
 describe("GPS Message Format", () => {
   it("should create valid GPS message structure", () => {
     const vehicle = demoVehicles[0];
+    const timestamp = new Date().toISOString();
     const message: GpsMessage = {
       vehicleId: vehicle.vehicleId,
-      timestamp: new Date().toISOString(),
+      timestamp,
+      timestampMs: Date.parse(timestamp),
       lat: vehicle.startPosition.lat,
       lng: vehicle.startPosition.lng,
       speed: 0,

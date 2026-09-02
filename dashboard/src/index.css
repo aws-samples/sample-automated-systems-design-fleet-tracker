@@ -88,10 +88,12 @@ body {
   font-weight: 500;
 }
 
-.status-moving { background: #c8e6c9; color: #2e7d32; }
-.status-stopped { background: #fff3e0; color: #ef6c00; }
-.status-offline { background: #ffcdd2; color: #c62828; }
 .status-available { background: #e3f2fd; color: #1565c0; }
+.status-en-route { background: #c8e6c9; color: #2e7d32; }
+.status-returning { background: #fff3e0; color: #ef6c00; }
+.status-on-site { background: #ede7f6; color: #4527a0; }
+.status-idle { background: #eceff1; color: #455a64; }
+.status-offline { background: #ffcdd2; color: #c62828; }
 
 .dispatch-panel {
   padding: 16px;

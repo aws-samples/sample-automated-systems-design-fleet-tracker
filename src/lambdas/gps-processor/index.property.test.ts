@@ -15,20 +15,17 @@
 import * as fc from "fast-check";
 import { mockClient } from "aws-sdk-client-mock";
 import { DynamoDBDocumentClient, UpdateCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
-import { LocationClient, BatchUpdateDevicePositionCommand } from "@aws-sdk/client-location";
 import { KinesisStreamEvent, KinesisStreamRecord } from "aws-lambda";
 
 // Set environment variables BEFORE importing handler
 process.env.VEHICLE_STATE_TABLE = "vehicle-current-state";
 process.env.GPS_HISTORY_TABLE = "gps-history";
-process.env.TRACKER_NAME = "fleet-tracker";
 
 // Import handler AFTER setting environment variables
 import { handler } from "./index";
 
 // Mock AWS clients
 const ddbMock = mockClient(DynamoDBDocumentClient);
-const locationMock = mockClient(LocationClient);
 
 // Arbitrary generators for GPS data
 const vehicleIdArb = fc.stringMatching(/^vehicle-[0-9]{3}$/);
@@ -83,103 +80,29 @@ function createKinesisEvent(gpsMessage: object): KinesisStreamEvent {
 describe("GPS Processor Property Tests", () => {
   beforeEach(() => {
     ddbMock.reset();
-    locationMock.reset();
     jest.clearAllMocks();
   });
 
-  /**
-   * Property 14: Tracker Position Update Structure
-   * Requirements: 7.1, 7.2
-   * 
-   * For any valid GPS message, the tracker update should contain:
-   * - DeviceId matching vehicleId
-   * - Position as [longitude, latitude] array
-   * - SampleTime from the GPS timestamp
-   */
-  describe("Property 14: Tracker Position Update Structure", () => {
-    it("should send position to tracker with correct structure for any valid GPS message", async () => {
-      await fc.assert(
-        fc.asyncProperty(gpsMessageArb, async (gpsMessage) => {
-          ddbMock.reset();
-          locationMock.reset();
-          ddbMock.on(UpdateCommand).resolves({});
-          ddbMock.on(PutCommand).resolves({});
-          locationMock.on(BatchUpdateDevicePositionCommand).resolves({});
-
-          const event = createKinesisEvent(gpsMessage);
-          await handler(event);
-
-          // Verify tracker was called
-          const trackerCalls = locationMock.commandCalls(BatchUpdateDevicePositionCommand);
-          expect(trackerCalls.length).toBe(1);
-
-          const trackerInput = trackerCalls[0].args[0].input;
-          expect(trackerInput.TrackerName).toBe("fleet-tracker");
-          expect(trackerInput.Updates).toHaveLength(1);
-
-          const update = trackerInput.Updates![0];
-          // DeviceId should match vehicleId
-          expect(update.DeviceId).toBe(gpsMessage.vehicleId);
-          // Position should be [longitude, latitude]
-          expect(update.Position).toEqual([gpsMessage.lng, gpsMessage.lat]);
-          // SampleTime should be a Date object from the timestamp
-          expect(update.SampleTime).toEqual(new Date(gpsMessage.timestamp));
-        }),
-        { numRuns: 50 }
-      );
-    });
-  });
+  // Properties 14 and 15 (tracker update structure and tracker failure isolation) were
+  // removed with the Lambda's Location Service call. Positions now reach the tracker via
+  // the native `location` IoT rule action, covered in infra/test/location-stack.test.ts.
 
   /**
-   * Property 15: Tracker Failure Isolation
-   * Requirements: 7.4
-   * 
-   * For any GPS message, if the tracker API fails, DynamoDB updates should still succeed.
-   * The handler should not throw an error.
-   */
-  describe("Property 15: Tracker Failure Isolation", () => {
-    it("should continue DynamoDB updates even when tracker fails", async () => {
-      await fc.assert(
-        fc.asyncProperty(gpsMessageArb, async (gpsMessage) => {
-          ddbMock.reset();
-          locationMock.reset();
-          ddbMock.on(UpdateCommand).resolves({});
-          ddbMock.on(PutCommand).resolves({});
-          // Simulate tracker failure
-          locationMock.on(BatchUpdateDevicePositionCommand).rejects(new Error("Tracker API error"));
-
-          const event = createKinesisEvent(gpsMessage);
-          
-          // Handler should NOT throw despite tracker failure
-          await expect(handler(event)).resolves.toBeUndefined();
-
-          // DynamoDB should still be updated
-          const updateCalls = ddbMock.commandCalls(UpdateCommand);
-          const putCalls = ddbMock.commandCalls(PutCommand);
-          expect(updateCalls.length).toBe(1); // Vehicle state update
-          expect(putCalls.length).toBe(1); // GPS history archive
-        }),
-        { numRuns: 30 }
-      );
-    });
-  });
-
-  /**
-   * Property 16: DynamoDB Independence from Tracker Filtering
+   * Property 16: DynamoDB Independence from Location Path Filtering
    * Requirements: 8.4
    * 
-   * For any GPS message, DynamoDB should receive all position updates
-   * regardless of whether the tracker filters them out.
+   * For any GPS message, DynamoDB should receive every position update. This is the
+   * invariant that makes the two-rule split safe: the Location Service path may be
+   * filtered to control tracker and geofence costs, but the Kinesis -> Lambda ->
+   * DynamoDB path is never filtered, so route playback stays complete.
    */
-  describe("Property 16: DynamoDB Independence from Tracker Filtering", () => {
-    it("should update DynamoDB for every GPS message regardless of tracker response", async () => {
+  describe("Property 16: DynamoDB Independence from Location Path Filtering", () => {
+    it("should update DynamoDB for every GPS message", async () => {
       await fc.assert(
         fc.asyncProperty(gpsMessageArb, async (gpsMessage) => {
           ddbMock.reset();
-          locationMock.reset();
           ddbMock.on(UpdateCommand).resolves({});
           ddbMock.on(PutCommand).resolves({});
-          locationMock.on(BatchUpdateDevicePositionCommand).resolves({});
 
           const event = createKinesisEvent(gpsMessage);
           await handler(event);
@@ -220,10 +143,8 @@ describe("GPS Processor Property Tests", () => {
       await fc.assert(
         fc.asyncProperty(gpsMessageArb, async (gpsMessage) => {
           ddbMock.reset();
-          locationMock.reset();
           ddbMock.on(UpdateCommand).resolves({});
           ddbMock.on(PutCommand).resolves({});
-          locationMock.on(BatchUpdateDevicePositionCommand).resolves({});
 
           const event = createKinesisEvent(gpsMessage);
           await handler(event);
@@ -267,10 +188,8 @@ describe("GPS Processor Property Tests", () => {
           staleTimestampArb,
           async (vehicleId, lat, lng, heading, speed, ignition, timestamp) => {
             ddbMock.reset();
-            locationMock.reset();
             ddbMock.on(UpdateCommand).resolves({});
             ddbMock.on(PutCommand).resolves({});
-            locationMock.on(BatchUpdateDevicePositionCommand).resolves({});
 
             const gpsMessage = { vehicleId, lat, lng, heading, speed, ignition, timestamp };
             const event = createKinesisEvent(gpsMessage);
@@ -300,10 +219,8 @@ describe("GPS Processor Property Tests", () => {
       await fc.assert(
         fc.asyncProperty(gpsMessageArb, async (gpsMessage) => {
           ddbMock.reset();
-          locationMock.reset();
           ddbMock.on(UpdateCommand).resolves({});
           ddbMock.on(PutCommand).resolves({});
-          locationMock.on(BatchUpdateDevicePositionCommand).resolves({});
 
           const event = createKinesisEvent(gpsMessage);
           await handler(event);

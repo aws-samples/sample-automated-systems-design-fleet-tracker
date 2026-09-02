@@ -34,14 +34,18 @@ The central map renders vehicle positions in real time using MapLibre GL JS over
 
 Left sidebar listing all vehicles with their status badge, current speed, and time since last update. Clicking a vehicle selects it and centers the map.
 
-**Status values** (matching the platform's vehicle state lifecycle):
+**Status values.** The dashboard renders whatever status the backend wrote, verbatim. Three statuses are actually produced by the platform; `offline` is a dashboard-side fallback:
 
-| Status | Meaning | Badge color |
-|--------|---------|-------------|
-| `available` | Idle, ready for dispatch | Blue |
-| `moving` | En route or actively driving | Green |
-| `stopped` | Parked / not moving | Orange |
-| `offline` | No GPS update for >5 minutes | Red |
+| Status | Meaning | Written by | Badge color |
+|--------|---------|-----------|-------------|
+| `available` | Idle, ready for dispatch | Job completion (`PUT /jobs/{id}`) or home-base geofence ENTER | Blue |
+| `en-route` | Assigned a job, driving to the job site | `POST /jobs` | Green |
+| `returning` | Job site reached, driving back to home base | Job-site geofence ENTER | Orange |
+| `offline` | Vehicle has no `status` field yet — set by the dashboard, not the backend | `services/api.ts` fallback | Red |
+
+Two further values, `on-site` and `idle`, are declared in the `VehicleStatus` union (`src/shared/types.ts`) and styled by the dashboard, but no handler currently writes them.
+
+> Staleness is tracked separately from status. The vehicle detail panel flags a vehicle whose last update is more than **2 minutes** old with a warning banner; it does not change the vehicle's status. The `FleetTracking/ActiveVehicles` metric uses a separate 5-minute threshold.
 
 ### Vehicle detail panel
 
@@ -134,12 +138,14 @@ The `$connect` Lambda validates the token. After connecting, vehicle updates arr
     "position": { "lat": 40.7128, "lng": -74.0060 },
     "heading": 180,
     "speed": 45,
-    "status": "moving",
+    "status": "en-route",
     "ignition": true
   },
   "timestamp": "2026-03-25T14:30:00Z"
 }
 ```
+
+`VEHICLE_UPDATE` is the only message type the dashboard acts on. `timestamp` is the broadcast time, not the GPS capture time.
 
 ---
 
@@ -203,6 +209,7 @@ Invalidation takes 5–15 minutes to complete in the background, but the dashboa
 
 - **Identity Pool credentials missing**: The Cognito Identity Pool must grant `geo:GetMapTile` and related permissions for the `fleet-map` resource. The CDK stack handles this — if you see permission errors, redeploy `FleetApiStack`.
 - **Wrong region**: `VITE_AWS_REGION` must match the region where Location Service is deployed.
+- **Map is a flat blue rectangle with no vehicles**: this is the MapLibre web worker failing to load, not a credentials or Location Service problem. MapLibre parses vector tiles in a worker; when the worker 404s, only the style's background layer paints (a flat blue in Esri Navigation) and the map's `load` event never fires, so no markers are added either. Attribution and the zoom controls still render, which makes it look like an auth issue. MapLibre v6 requires an explicit `maplibregl.setWorkerUrl(...)` call under any bundler — `FleetMap.tsx` does this with Vite's `?worker&url` import. Confirm `dist/assets/` contains a `maplibre-gl-worker-*.js` file after `npm run build`; if it doesn't, that call is missing or was tree-shaken.
 
 ### Authentication errors
 
@@ -220,8 +227,10 @@ Invalidation takes 5–15 minutes to complete in the background, but the dashboa
 
 ## Browser support
 
-The dashboard uses modern web APIs (WebSocket, ES2020, MapLibre GL JS) and was tested against:
+The dashboard uses modern web APIs (WebSocket, ES2022, MapLibre GL JS v6). **MapLibre GL JS v6 requires WebGL2**, which raises the floor on Safari in particular:
 
 - Chrome / Edge 90+
 - Firefox 88+
-- Safari 14+
+- Safari 15+ (WebGL2 is not enabled by default before 15)
+
+MapLibre's stylesheet is bundled through an `import` in `src/main.tsx` rather than loaded from a CDN, so it cannot drift from the installed `maplibre-gl` version.

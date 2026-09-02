@@ -1,8 +1,18 @@
 import { useRef, useEffect, useState, useCallback } from "react";
-import maplibregl from "maplibre-gl";
+// maplibre-gl v6 is ESM-only and no longer provides a default export.
+import * as maplibregl from "maplibre-gl";
+// v6 ships its worker as a separate ES module that imports a shared chunk, resolved
+// internally via `import.meta.url`. Bundlers can't follow that, so without an explicit
+// worker URL the worker 404s: vector tiles are never parsed and the map renders only the
+// style's background layer (a flat blue for Esri Navigation) with no markers, because
+// `load` never fires. Vite's `?worker&url` emits the worker as an asset and inlines the
+// shared chunk. Must be called once before any Map is constructed.
+import maplibreWorkerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
 import { fetchAuthSession } from "aws-amplify/auth";
 import { Signer } from "@aws-amplify/core/internals/utils";
 import type { Vehicle } from "../types";
+
+maplibregl.setWorkerUrl(maplibreWorkerUrl);
 
 interface FleetMapProps {
   vehicles: Vehicle[];
@@ -113,8 +123,8 @@ export function FleetMap({ vehicles, selectedVehicle, onSelectVehicle, historyTr
           if (!cancelled) setMapReady(true);
         });
 
-        map.current.on("error", (e) => {
-          console.error("Map error:", e);
+        map.current.on("error", (e: maplibregl.ErrorEvent) => {
+          console.error("Map error:", e.error ?? e);
         });
       } catch (error) {
         console.error("Failed to initialize map:", error);

@@ -64,7 +64,7 @@ Tokens are valid for one hour.
 |----------|-------------|
 | `GET /vehicles` | List all vehicles with current positions |
 | `GET /vehicles/{id}` | Single vehicle detail |
-| `GET /vehicles/{id}/history?hours=N` | GPS history (max 24h, configurable) |
+| `GET /vehicles/{id}/history?hours=N` | GPS history. `hours` must be a positive integer, defaults to 24 and is capped at 24 — the `gps-history` table has a 24-hour TTL, so a wider window returns nothing extra. Non-numeric values return 400. |
 | `GET /vehicles/{id}/eta?destination=...` | Calculate ETA to a destination |
 
 ### Jobs
@@ -143,11 +143,41 @@ The token is validated on `$connect`. After connecting, you'll receive position 
 # Faster updates for demos (2 seconds)
 PUBLISH_INTERVAL=2000 ./scripts/start-simulator.sh
 
-# Or via npm script (3-second interval)
+# Or via npm script (5-second interval — same as the default)
 npm run simulator:demo
+
+# Production-style cost optimization: only send positions to the Location Service
+# tracker when a vehicle is near its job destination or home base
+LOCATION_PROXIMITY_FILTER=true ./scripts/start-simulator.sh
 ```
 
-The simulator reads `IOT_ENDPOINT` from CloudFormation, finds certificates in `./certs/`, and publishes GPS updates on behalf of each demo vehicle.
+`start-simulator.sh` resolves the IoT endpoint with `aws iot describe-endpoint --endpoint-type iot:Data-ATS` unless you export `IOT_ENDPOINT` yourself, downloads the Amazon root CA if it's missing, finds per-vehicle certificates in `./certs/<vehicleId>/`, and publishes GPS updates on behalf of each demo vehicle. It reads no CloudFormation outputs.
+
+Each vehicle publishes to two Basic Ingest topics: the ingestion rule always receives every
+position, and the Location Service rule receives either every position (default) or only
+nearby ones when proximity filtering is enabled.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PUBLISH_INTERVAL` | `5000` | Milliseconds between position updates |
+| `GPS_INGEST_RULE_NAME` | `fleet_gps_to_kinesis` | IoT rule that feeds the Kinesis/DynamoDB pipeline |
+| `GPS_LOCATION_RULE_NAME` | `fleet_gps_to_location` | IoT rule that writes to the Location Service tracker |
+| `LOCATION_PROXIMITY_FILTER` | `false` | When `true`, only publish to the tracker rule near a point of interest |
+| `LOCATION_PROXIMITY_RADIUS_M` | `2000` | Proximity radius in metres. Keep it well above your geofence radius so EXIT events still fire |
+
+This device-side filter is the *second* layer of Location Service cost control. The first is
+the tracker's own `positionFiltering`, set to `DistanceBased` in `LocationStack`, which makes
+Amazon Location ignore updates under 30 m so they are neither stored nor evaluated against
+geofences. To inspect it:
+
+```bash
+aws location describe-tracker --tracker-name fleet-tracker \
+  --query 'PositionFiltering' --region "${AWS_REGION:-us-east-1}"
+```
+
+Do not switch it to `TimeBased` (the service default) expecting savings — that mode only
+thins stored positions, and every update is still evaluated and billed. `AccuracyBased` will
+not work here either, because the native Location rule action sends no accuracy value.
 
 ### Add or modify vehicles
 
@@ -169,9 +199,34 @@ To add more vehicles:
 
 To publish a single GPS message without the simulator:
 
+The topic uses the [Basic Ingest](https://docs.aws.amazon.com/iot/latest/developerguide/iot-basic-ingest.html)
+reserved prefix `$aws/rules/<rule-name>`, which delivers the message straight to the
+`fleet_gps_to_kinesis` rule and bypasses the pub/sub message broker. Because the broker is
+skipped, you can't subscribe to this topic to observe the message — check the Kinesis stream,
+the GPS processor Lambda logs, or the dashboard instead.
+
+There is a second topic for the Amazon Location Service tracker, handled by the
+`fleet_gps_to_location` rule's native Location action. Publish the same payload there to
+see the position land on the tracker and trigger geofence evaluation:
+
 ```bash
 aws iot-data publish \
-  --topic "fleet/vehicles/vehicle-001/gps" \
+  --topic "\$aws/rules/fleet_gps_to_location/fleet/vehicles/vehicle-001/gps" \
+  --payload '{"vehicleId":"vehicle-001","lat":40.7128,"lng":-74.0060,"timestampMs":'"$(date +%s)"'000}' \
+  --region "${AWS_REGION:-us-east-1}"
+
+# Confirm the tracker received it
+aws location batch-get-device-position \
+  --tracker-name fleet-tracker --device-ids vehicle-001 \
+  --region "${AWS_REGION:-us-east-1}"
+```
+
+The Location action reads `timestampMs` (epoch milliseconds) from the payload. Trackers
+ignore sample times older than 30 days.
+
+```bash
+aws iot-data publish \
+  --topic "\$aws/rules/fleet_gps_to_kinesis/fleet/vehicles/vehicle-001/gps" \
   --payload "$(cat <<EOF
 {
   "vehicleId": "vehicle-001",
@@ -264,7 +319,6 @@ aws logs tail "/aws/lambda/$GPS_FN" --follow
 | `update-ip-allowlist.sh` | Update WAF IP allowlist for the current public IP (re-run if your IP changes) |
 | `pre-cleanup.sh` | Detach resources that block CDK stack deletion. Run **before** `cdk destroy --all` |
 | `post-cleanup.sh` | Remove orphaned resources after CDK destroy |
-| `import-grafana-dashboard.sh` | (Optional) Import the fleet tracking dashboard into a Grafana workspace |
 
 All scripts source `scripts/lib/config.sh` for shared configuration (`AWS_REGION`, `FLEET_VEHICLES`, etc.).
 
@@ -277,7 +331,6 @@ All scripts source `scripts/lib/config.sh` for shared configuration (`AWS_REGION
 | `VEHICLE_STATE_TABLE` | DynamoDB table for vehicle current state |
 | `GPS_HISTORY_TABLE` | DynamoDB table for GPS history (24h TTL) |
 | `DISPATCH_TABLE` | DynamoDB table for job assignments |
-| `TRACKER_NAME` | Location Service tracker name |
 | `GEOFENCE_COLLECTION_NAME` | Location Service geofence collection name |
 | `JOB_COMPLETION_TOPIC_ARN` | SNS topic for job completion notifications |
 | `WEBSOCKET_ENDPOINT` | API Gateway Management API endpoint for WebSocket broadcasts |

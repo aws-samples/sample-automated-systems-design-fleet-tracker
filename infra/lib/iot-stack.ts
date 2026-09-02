@@ -51,7 +51,18 @@ export class IoTStack extends cdk.Stack {
             Effect: "Allow",
             Action: "iot:Publish",
             Resource: [
-              `arn:aws:iot:${this.region}:${this.account}:topic/fleet/vehicles/\${iot:Connection.Thing.ThingName}/*`,
+              // Basic Ingest: GPS telemetry goes straight to a named rule, bypassing
+              // the pub/sub message broker. Each topic is scoped to this thing's own
+              // vehicle rather than granting the whole $aws/rules/* namespace.
+              // Devices publish GPS only over Basic Ingest, so no brokered
+              // fleet/vehicles/* publish grant is needed.
+              //
+              // Two topics because there are two rules: every position goes to the
+              // Kinesis/DynamoDB pipeline, while the Location Service tracker path can
+              // be filtered independently (a rule's WHERE clause covers the whole rule,
+              // so one rule could not do both).
+              `arn:aws:iot:${this.region}:${this.account}:topic/$aws/rules/fleet_gps_to_kinesis/fleet/vehicles/\${iot:Connection.Thing.ThingName}/gps`,
+              `arn:aws:iot:${this.region}:${this.account}:topic/$aws/rules/fleet_gps_to_location/fleet/vehicles/\${iot:Connection.Thing.ThingName}/gps`,
               `arn:aws:iot:${this.region}:${this.account}:topic/$aws/things/\${iot:Connection.Thing.ThingName}/shadow/*`,
             ],
           },
@@ -182,7 +193,7 @@ export class IoTStack extends cdk.Stack {
           },
         },
       });
-      thing.addDependency(this.thingGroup);
+      thing.addResourceDependency(this.thingGroup);
       this.vehicleThings.push(thing);
 
       // Add Thing to Thing Group

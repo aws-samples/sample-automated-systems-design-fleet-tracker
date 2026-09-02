@@ -1,19 +1,16 @@
 import { KinesisStreamEvent, KinesisStreamRecord } from "aws-lambda";
 import { mockClient } from "aws-sdk-client-mock";
 import { DynamoDBDocumentClient, UpdateCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
-import { LocationClient, BatchUpdateDevicePositionCommand } from "@aws-sdk/client-location";
 
 // Set environment variables BEFORE importing handler
 process.env.VEHICLE_STATE_TABLE = "vehicle-current-state";
 process.env.GPS_HISTORY_TABLE = "gps-history";
-process.env.TRACKER_NAME = "fleet-tracker";
 
 // Import handler AFTER setting environment variables
 import { handler } from "./index";
 
 // Mock AWS clients
 const ddbMock = mockClient(DynamoDBDocumentClient);
-const locationMock = mockClient(LocationClient);
 
 // Helper to create a Kinesis record
 function createKinesisRecord(gpsMessage: object): KinesisStreamRecord {
@@ -50,7 +47,6 @@ const sampleGpsMessage = {
 describe("GPS Processor Lambda", () => {
   beforeEach(() => {
     ddbMock.reset();
-    locationMock.reset();
     jest.clearAllMocks();
   });
 
@@ -58,7 +54,6 @@ describe("GPS Processor Lambda", () => {
     it("should process a single GPS record successfully", async () => {
       ddbMock.on(UpdateCommand).resolves({});
       ddbMock.on(PutCommand).resolves({});
-      locationMock.on(BatchUpdateDevicePositionCommand).resolves({});
 
       const event: KinesisStreamEvent = {
         Records: [createKinesisRecord(sampleGpsMessage)],
@@ -79,7 +74,6 @@ describe("GPS Processor Lambda", () => {
     it("should process multiple GPS records in batch", async () => {
       ddbMock.on(UpdateCommand).resolves({});
       ddbMock.on(PutCommand).resolves({});
-      locationMock.on(BatchUpdateDevicePositionCommand).resolves({});
 
       const messages = [
         { ...sampleGpsMessage, vehicleId: "vehicle-001" },
@@ -101,7 +95,6 @@ describe("GPS Processor Lambda", () => {
     it("should throw error when any record fails", async () => {
       ddbMock.on(UpdateCommand).rejectsOnce(new Error("DynamoDB error")).resolves({});
       ddbMock.on(PutCommand).resolves({});
-      locationMock.on(BatchUpdateDevicePositionCommand).resolves({});
 
       const event: KinesisStreamEvent = {
         Records: [
@@ -118,7 +111,6 @@ describe("GPS Processor Lambda", () => {
     it("should update vehicle state with correct position data", async () => {
       ddbMock.on(UpdateCommand).resolves({});
       ddbMock.on(PutCommand).resolves({});
-      locationMock.on(BatchUpdateDevicePositionCommand).resolves({});
 
       const event: KinesisStreamEvent = {
         Records: [createKinesisRecord(sampleGpsMessage)],
@@ -140,7 +132,6 @@ describe("GPS Processor Lambda", () => {
     it("should archive GPS history with TTL", async () => {
       ddbMock.on(UpdateCommand).resolves({});
       ddbMock.on(PutCommand).resolves({});
-      locationMock.on(BatchUpdateDevicePositionCommand).resolves({});
 
       const event: KinesisStreamEvent = {
         Records: [createKinesisRecord(sampleGpsMessage)],
@@ -176,7 +167,6 @@ describe("GPS Processor Lambda", () => {
         .rejectsOnce(conditionalError)
         .resolves({});
       ddbMock.on(PutCommand).resolves({});
-      locationMock.on(BatchUpdateDevicePositionCommand).resolves({});
 
       const event: KinesisStreamEvent = {
         Records: [createKinesisRecord(sampleGpsMessage)],
@@ -194,7 +184,6 @@ describe("GPS Processor Lambda", () => {
     it("should set status to offline when ignition is off", async () => {
       ddbMock.on(UpdateCommand).resolves({});
       ddbMock.on(PutCommand).resolves({});
-      locationMock.on(BatchUpdateDevicePositionCommand).resolves({});
 
       const offlineMessage = { ...sampleGpsMessage, ignition: false, speed: 0 };
       const event: KinesisStreamEvent = {
@@ -210,7 +199,6 @@ describe("GPS Processor Lambda", () => {
     it("should set status to idle when ignition on but speed is 0", async () => {
       ddbMock.on(UpdateCommand).resolves({});
       ddbMock.on(PutCommand).resolves({});
-      locationMock.on(BatchUpdateDevicePositionCommand).resolves({});
 
       const idleMessage = { ...sampleGpsMessage, ignition: true, speed: 0 };
       const event: KinesisStreamEvent = {
@@ -226,7 +214,6 @@ describe("GPS Processor Lambda", () => {
     it("should set status to available when moving", async () => {
       ddbMock.on(UpdateCommand).resolves({});
       ddbMock.on(PutCommand).resolves({});
-      locationMock.on(BatchUpdateDevicePositionCommand).resolves({});
 
       const movingMessage = { ...sampleGpsMessage, ignition: true, speed: 35 };
       const event: KinesisStreamEvent = {
@@ -240,53 +227,14 @@ describe("GPS Processor Lambda", () => {
     });
   });
 
-  // Task 9.7: Unit tests for GPS processor enhancements
-  describe("tracker integration (Task 8.2)", () => {
-    it("should send position to tracker with correct format", async () => {
-      ddbMock.on(UpdateCommand).resolves({});
-      ddbMock.on(PutCommand).resolves({});
-      locationMock.on(BatchUpdateDevicePositionCommand).resolves({});
-
-      const event: KinesisStreamEvent = {
-        Records: [createKinesisRecord(sampleGpsMessage)],
-      };
-
-      await handler(event);
-
-      // Verify tracker was called
-      const trackerCalls = locationMock.commandCalls(BatchUpdateDevicePositionCommand);
-      expect(trackerCalls).toHaveLength(1);
-
-      const trackerInput = trackerCalls[0].args[0].input;
-      expect(trackerInput.TrackerName).toBe("fleet-tracker");
-      expect(trackerInput.Updates).toHaveLength(1);
-      expect(trackerInput.Updates![0].DeviceId).toBe("vehicle-001");
-      expect(trackerInput.Updates![0].Position).toEqual([-122.4194, 37.7749]); // [lng, lat]
-    });
-
-    it("should continue processing when tracker fails", async () => {
-      ddbMock.on(UpdateCommand).resolves({});
-      ddbMock.on(PutCommand).resolves({});
-      locationMock.on(BatchUpdateDevicePositionCommand).rejects(new Error("Tracker API error"));
-
-      const event: KinesisStreamEvent = {
-        Records: [createKinesisRecord(sampleGpsMessage)],
-      };
-
-      // Should NOT throw despite tracker failure
-      await expect(handler(event)).resolves.toBeUndefined();
-
-      // DynamoDB should still be updated
-      expect(ddbMock.commandCalls(UpdateCommand)).toHaveLength(1);
-      expect(ddbMock.commandCalls(PutCommand)).toHaveLength(1);
-    });
-  });
+  // Note: tracker integration tests were removed along with the Lambda's Location
+  // Service call. Positions now reach the tracker via the native `location` IoT rule
+  // action (GpsToLocationRule), which is asserted in infra/test/location-stack.test.ts.
 
   describe("stale timestamp handling (Task 9.3)", () => {
     it("should process stale timestamps without rejection", async () => {
       ddbMock.on(UpdateCommand).resolves({});
       ddbMock.on(PutCommand).resolves({});
-      locationMock.on(BatchUpdateDevicePositionCommand).resolves({});
 
       // Create a message with a timestamp 10 minutes old
       const staleTimestamp = new Date(Date.now() - 10 * 60 * 1000).toISOString();
@@ -308,7 +256,6 @@ describe("GPS Processor Lambda", () => {
     it("should use GPS payload timestamp for lastSeen", async () => {
       ddbMock.on(UpdateCommand).resolves({});
       ddbMock.on(PutCommand).resolves({});
-      locationMock.on(BatchUpdateDevicePositionCommand).resolves({});
 
       const event: KinesisStreamEvent = {
         Records: [createKinesisRecord(sampleGpsMessage)],
@@ -325,7 +272,6 @@ describe("GPS Processor Lambda", () => {
     it("should not overwrite tenantId in update expression", async () => {
       ddbMock.on(UpdateCommand).resolves({});
       ddbMock.on(PutCommand).resolves({});
-      locationMock.on(BatchUpdateDevicePositionCommand).resolves({});
 
       const event: KinesisStreamEvent = {
         Records: [createKinesisRecord(sampleGpsMessage)],

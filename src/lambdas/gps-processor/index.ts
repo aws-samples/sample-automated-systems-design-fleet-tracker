@@ -4,16 +4,16 @@
  * Processes GPS messages from Kinesis Data Streams and:
  * 1. Upserts vehicle-current-state table with latest position
  * 2. Archives each GPS update to gps-history table with 24h TTL
- * 3. Sends position updates to Location Service Tracker for geofence evaluation
  * 
- * Requirements: 2.5, 2.6, 2.7, 6.4, 7.1, 7.2, 7.4, 8.4, 11.2, 11.3, 12.6
+ * Position updates to the Amazon Location Service tracker are NOT handled here. They
+ * are sent by the native `location` IoT rule action (GpsToLocationRule in
+ * LocationStack), which writes to the tracker directly with no Lambda in the path.
+ * 
+ * Requirements: 2.5, 2.6, 2.7, 6.4, 11.2, 11.3, 12.6
  * - Lambda Kinesis consumer processes batches and upserts DynamoDB
  * - DynamoDB record includes: vehicleId (PK), position, heading, speed, lastSeen, status, assignedJob
  * - Lambda archives each GPS update to gps-history table
  * - TTL on gps-history records (24 hours) to auto-expire old data
- * - Sends positions to Location Service Tracker (7.1, 7.2)
- * - Handles Tracker API failures gracefully (7.4)
- * - DynamoDB updates independent of Tracker filtering (8.4)
  * - Uses timestamp from GPS payload (11.2)
  * - Logs warning for stale timestamps (11.3)
  * - Preserves tenantId on updates (12.6)
@@ -29,10 +29,6 @@ import {
   PutCommand,
   BatchWriteCommand
 } from "@aws-sdk/lib-dynamodb";
-import {
-  LocationClient,
-  BatchUpdateDevicePositionCommand,
-} from "@aws-sdk/client-location";
 import { 
   GpsMessage, 
   VehicleStatus, 
@@ -47,13 +43,9 @@ const ddb = DynamoDBDocumentClient.from(ddbClient, {
   },
 });
 
-// Initialize Location Service Client
-const locationClient = new LocationClient({});
-
 // Environment variables
 const VEHICLE_STATE_TABLE = process.env.VEHICLE_STATE_TABLE!;
 const GPS_HISTORY_TABLE = process.env.GPS_HISTORY_TABLE!;
-const TRACKER_NAME = process.env.TRACKER_NAME;
 
 // TTL duration: 24 hours in seconds
 const TTL_DURATION_SECONDS = 24 * 60 * 60;
@@ -162,55 +154,6 @@ async function archiveGpsHistory(gpsMessage: GpsMessage): Promise<void> {
 }
 
 /**
- * Send position update to Location Service Tracker (Task 8.2)
- * Requirements: 7.1, 7.2, 7.4
- * - Calls BatchUpdateDevicePosition API with vehicleId, lat, lng, timestamp
- * - Handles Tracker API failures gracefully (log and continue)
- */
-async function sendPositionToTracker(gpsMessage: GpsMessage): Promise<void> {
-  if (!TRACKER_NAME) {
-    // Tracker not configured, skip silently
-    return;
-  }
-
-  try {
-    // Convert ISO timestamp to Date object for Location Service API
-    const sampleTime = new Date(gpsMessage.timestamp);
-
-    await locationClient.send(
-      new BatchUpdateDevicePositionCommand({
-        TrackerName: TRACKER_NAME,
-        Updates: [
-          {
-            DeviceId: gpsMessage.vehicleId,
-            Position: [gpsMessage.lng, gpsMessage.lat], // [longitude, latitude]
-            SampleTime: sampleTime,
-            Accuracy: { Horizontal: gpsMessage.accuracy || 10 },
-          },
-        ],
-      })
-    );
-
-    console.log(JSON.stringify({
-      level: "DEBUG",
-      message: "Position sent to tracker",
-      vehicleId: gpsMessage.vehicleId,
-      trackerName: TRACKER_NAME,
-    }));
-  } catch (error) {
-    // Requirement 7.4: Handle Tracker API failures gracefully (log and continue)
-    console.log(JSON.stringify({
-      level: "WARN",
-      message: "Failed to send position to tracker - continuing with DynamoDB update",
-      vehicleId: gpsMessage.vehicleId,
-      trackerName: TRACKER_NAME,
-      error: error instanceof Error ? error.message : String(error),
-    }));
-    // Do NOT rethrow - DynamoDB updates should continue regardless of Tracker failures
-  }
-}
-
-/**
  * Check if timestamp is stale (older than 5 minutes) (Task 9.3)
  * Requirement 11.3: Log warning for timestamps older than 5 minutes
  */
@@ -256,12 +199,9 @@ async function processGpsRecord(record: KinesisStreamRecord): Promise<void> {
     timestamp: gpsMessage.timestamp,
   }));
 
-  // Requirement 7.4, 8.4: Send to Tracker first (non-blocking, failures isolated)
-  // This runs independently - failures don't affect DynamoDB updates
-  await sendPositionToTracker(gpsMessage);
-
-  // Execute DynamoDB operations in parallel for efficiency
-  // Requirement 8.4: DynamoDB updates happen regardless of Tracker filtering
+  // Execute DynamoDB operations in parallel for efficiency.
+  // This Lambda receives every position regardless of whether the position was also
+  // forwarded to the Location Service tracker, so route playback stays complete.
   await Promise.all([
     upsertVehicleState(gpsMessage),
     archiveGpsHistory(gpsMessage),

@@ -14,7 +14,9 @@ export function DispatchPanel({ vehicles, onJobCreated }: DispatchPanelProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const availableVehicles = vehicles.filter((v) => v.status === "available" || v.status === "stopped");
+  // POST /jobs rejects any vehicle whose status is not exactly "available"
+  // (see vehicle-api createJob), so only offer those in the dropdown.
+  const availableVehicles = vehicles.filter((v) => v.status === "available");
 
   const handleVehicleChange = async (vehicleId: string) => {
     setSelectedVehicle(vehicleId);

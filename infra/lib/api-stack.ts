@@ -206,7 +206,10 @@ export class ApiStack extends cdk.Stack {
     // Custom resource to create demo user
     const createDemoUserProvider = new cr.Provider(this, "CreateDemoUserProvider", {
       onEventHandler: new lambda.Function(this, "CreateDemoUserFunction", {
-        runtime: lambda.Runtime.NODEJS_18_X,
+        // Node 18 was deprecated 2025-09-01; creation is disabled from 2027-02-01.
+        // The inline handler below uses only AWS SDK v3 and plain JS, so it runs
+        // unchanged on 22.x — matching every other function in this app.
+        runtime: lambda.Runtime.NODEJS_22_X,
         handler: "index.handler",
         timeout: cdk.Duration.seconds(30),
         code: lambda.Code.fromInline(`
@@ -427,8 +430,13 @@ exports.handler = async (event) => {
           action: { allow: {} },
           statement: {
             sizeConstraintStatement: {
+              // `singleHeader` is typed `any` in CfnWebACL, i.e. a raw CloudFormation
+              // passthrough. CDK's camelCase-to-PascalCase conversion does not descend
+              // into `any` properties, so this object must already be PascalCase.
+              // Writing `{ name: ... }` emits an invalid template that CloudFormation
+              // happens to tolerate today; `cdk synth` flags it as F3002/F3003.
               fieldToMatch: {
-                singleHeader: { name: "authorization" },
+                singleHeader: { Name: "authorization" },
               },
               comparisonOperator: "GT",
               size: 0,
@@ -757,9 +765,9 @@ exports.handler = async (event) => {
     });
 
     // Ensure routes are created after integrations
-    connectRoute.addDependency(wsConnectIntegration);
-    disconnectRoute.addDependency(wsDisconnectIntegration);
-    defaultRoute.addDependency(wsConnectIntegration);
+    connectRoute.addResourceDependency(wsConnectIntegration);
+    disconnectRoute.addResourceDependency(wsDisconnectIntegration);
+    defaultRoute.addResourceDependency(wsConnectIntegration);
 
     // =========================================================================
     // Phase 2: Tenant API, Analytics API

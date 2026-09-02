@@ -43,7 +43,7 @@ describe("IoTStack", () => {
           Statement: Match.arrayWith([
             Match.objectLike({
               Effect: "Allow",
-              Action: ["iot:Connect"],
+              Action: "iot:Connect",
               Resource: Match.stringLikeRegexp(
                 "arn:aws:iot:.*:.*:client/\\$\\{iot:Connection\\.Thing\\.ThingName\\}"
               ),
@@ -53,16 +53,60 @@ describe("IoTStack", () => {
       });
     });
 
-    test("policy allows Publish to device-scoped topic", () => {
+    test("policy allows Publish to device-scoped Device Shadow topic", () => {
       template.hasResourceProperties("AWS::IoT::Policy", {
         PolicyDocument: Match.objectLike({
           Statement: Match.arrayWith([
             Match.objectLike({
               Effect: "Allow",
-              Action: ["iot:Publish"],
-              Resource: Match.stringLikeRegexp(
-                "arn:aws:iot:.*:.*:topic/fleet/vehicles/\\$\\{iot:Connection\\.Thing\\.ThingName\\}/\\*"
-              ),
+              Action: "iot:Publish",
+              Resource: Match.arrayWith([
+                Match.stringLikeRegexp(
+                  "arn:aws:iot:.*:.*:topic/\\$aws/things/\\$\\{iot:Connection\\.Thing\\.ThingName\\}/shadow/\\*"
+                ),
+              ]),
+            }),
+          ]),
+        }),
+      });
+    });
+
+    // GPS publishes over Basic Ingest only, so the broad brokered fleet/vehicles/*
+    // publish grant was removed. Guard against it being reintroduced.
+    test("policy does not grant brokered publish on fleet/vehicles topics", () => {
+      const policies = template.findResources("AWS::IoT::Policy");
+      const statements = Object.values(policies)[0].Properties.PolicyDocument.Statement;
+      const publishResources = statements
+        .filter((s: { Action: string }) => s.Action === "iot:Publish")
+        .flatMap((s: { Resource: string | string[] }) =>
+          Array.isArray(s.Resource) ? s.Resource : [s.Resource]
+        );
+
+      const brokeredGpsGrants = publishResources.filter((r: string) =>
+        /:topic\/fleet\/vehicles\//.test(r)
+      );
+      expect(brokeredGpsGrants).toEqual([]);
+      expect(
+        publishResources.some((r: string) =>
+          r.includes("topic/$aws/rules/fleet_gps_to_kinesis/fleet/vehicles/")
+        )
+      ).toBe(true);
+    });
+
+    // Basic Ingest: GPS telemetry publishes to the reserved $aws/rules/<rule-name> prefix,
+    // scoped to this thing's own topic rather than the whole $aws/rules/* namespace.
+    test("policy allows Publish to device-scoped Basic Ingest topic", () => {
+      template.hasResourceProperties("AWS::IoT::Policy", {
+        PolicyDocument: Match.objectLike({
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Effect: "Allow",
+              Action: "iot:Publish",
+              Resource: Match.arrayWith([
+                Match.stringLikeRegexp(
+                  "arn:aws:iot:.*:.*:topic/\\$aws/rules/fleet_gps_to_kinesis/fleet/vehicles/\\$\\{iot:Connection\\.Thing\\.ThingName\\}/gps"
+                ),
+              ]),
             }),
           ]),
         }),
@@ -75,10 +119,12 @@ describe("IoTStack", () => {
           Statement: Match.arrayWith([
             Match.objectLike({
               Effect: "Allow",
-              Action: ["iot:Subscribe"],
-              Resource: Match.stringLikeRegexp(
-                "arn:aws:iot:.*:.*:topicfilter/fleet/vehicles/\\$\\{iot:Connection\\.Thing\\.ThingName\\}/commands/\\*"
-              ),
+              Action: "iot:Subscribe",
+              Resource: Match.arrayWith([
+                Match.stringLikeRegexp(
+                  "arn:aws:iot:.*:.*:topicfilter/fleet/vehicles/\\$\\{iot:Connection\\.Thing\\.ThingName\\}/commands/\\*"
+                ),
+              ]),
             }),
           ]),
         }),
@@ -91,10 +137,12 @@ describe("IoTStack", () => {
           Statement: Match.arrayWith([
             Match.objectLike({
               Effect: "Allow",
-              Action: ["iot:Receive"],
-              Resource: Match.stringLikeRegexp(
-                "arn:aws:iot:.*:.*:topic/fleet/vehicles/\\$\\{iot:Connection\\.Thing\\.ThingName\\}/commands/\\*"
-              ),
+              Action: "iot:Receive",
+              Resource: Match.arrayWith([
+                Match.stringLikeRegexp(
+                  "arn:aws:iot:.*:.*:topic/fleet/vehicles/\\$\\{iot:Connection\\.Thing\\.ThingName\\}/commands/\\*"
+                ),
+              ]),
             }),
           ]),
         }),

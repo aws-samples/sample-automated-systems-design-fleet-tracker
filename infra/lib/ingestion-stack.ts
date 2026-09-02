@@ -17,12 +17,7 @@ import { Construct } from "constructs";
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
 const lambdaEntry = (p: string) => path.join(REPO_ROOT, "src", "lambdas", p);
 
-export interface IngestionStackProps extends cdk.StackProps {
-  // No longer needs trackerName - uses constant "fleet-tracker"
-}
-
-// Constant for tracker name - shared between IngestionStack and LocationStack
-export const FLEET_TRACKER_NAME = "fleet-tracker";
+export interface IngestionStackProps extends cdk.StackProps {}
 
 export class IngestionStack extends cdk.Stack {
   public readonly vehicleStateTable: dynamodb.Table;
@@ -36,14 +31,36 @@ export class IngestionStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: IngestionStackProps) {
     super(scope, id, props);
 
-    const trackerName = FLEET_TRACKER_NAME;
+    // Kinesis stream for GPS data fan-out.
+    //
+    // Defaults to ONE PROVISIONED SHARD. A shard carries 1 MB/sec or 1,000 records/sec for
+    // ~$10.95/month, and a GPS fleet needs a rounding error of that: 20 vehicles reporting
+    // every 5 seconds is 4 records/sec, under half a percent of a shard. Even 100 vehicles
+    // at 5 seconds uses 2%.
+    //
+    // On-demand would bill a flat ~$29/month stream-hour charge regardless of volume, which
+    // on a tuned 20-vehicle deployment costs more than every other pipeline service
+    // combined. A fleet reporting on a fixed timer has none of the unpredictability
+    // on-demand exists to absorb.
+    //
+    //   cdk deploy --all --context kinesisShards=4      # more provisioned capacity
+    //   cdk deploy --all --context kinesisOnDemand=true # spiky/unpredictable traffic
+    const onDemand = this.node.tryGetContext("kinesisOnDemand") === "true";
+    const kinesisShards = this.node.tryGetContext("kinesisShards");
+    const shardCount = kinesisShards === undefined ? 1 : Number(kinesisShards);
 
-    // Kinesis stream for GPS data fan-out
-    // On-demand mode auto-scales and is cost-effective for small fleets
+    if (!Number.isInteger(shardCount) || shardCount < 1) {
+      throw new Error(
+        `kinesisShards context must be a positive integer, got "${kinesisShards}"`
+      );
+    }
+
     this.gpsStream = new kinesis.Stream(this, "GpsStream", {
       streamName: "fleet-gps-stream",
-      streamMode: kinesis.StreamMode.ON_DEMAND,
       retentionPeriod: cdk.Duration.hours(24),
+      ...(onDemand
+        ? { streamMode: kinesis.StreamMode.ON_DEMAND }
+        : { streamMode: kinesis.StreamMode.PROVISIONED, shardCount }),
     });
 
     // DynamoDB: current vehicle state
@@ -138,22 +155,15 @@ export class IngestionStack extends cdk.Stack {
       environment: {
         VEHICLE_STATE_TABLE: this.vehicleStateTable.tableName,
         GPS_HISTORY_TABLE: this.gpsHistoryTable.tableName,
-        TRACKER_NAME: trackerName,
       },
     });
 
     this.vehicleStateTable.grantWriteData(gpsProcessor);
     this.gpsHistoryTable.grantWriteData(gpsProcessor);
 
-    // Grant Location Service permissions to GPS processor (Task 8.2)
-    gpsProcessor.addToRolePolicy(
-      new iam.PolicyStatement({
-        actions: ["geo:BatchUpdateDevicePosition"],
-        resources: [
-          `arn:aws:geo:${this.region}:${this.account}:tracker/${trackerName}`,
-        ],
-      })
-    );
+    // Note: this Lambda no longer writes to the Location Service tracker. Positions
+    // reach the tracker through the native `location` IoT rule action defined in
+    // LocationStack, so no geo: permissions are needed here.
 
     // Requirements: 2.5, 2.6, 2.7, 6.4 - Configure batch size 10, 5s window
     gpsProcessor.addEventSource(
@@ -194,7 +204,13 @@ export class IngestionStack extends cdk.Stack {
     this.iotRulesDlq.grantSendMessages(iotDlqRole);
 
     // IoT Rule: Route GPS messages to Kinesis Data Streams
-    // Listens on topic: fleet/vehicles/+/gps
+    // Devices publish via Basic Ingest to
+    //   $aws/rules/fleet_gps_to_kinesis/fleet/vehicles/<vehicleId>/gps
+    // which invokes this rule directly and bypasses the pub/sub message broker.
+    // IoT strips the $aws/rules/<rule-name> prefix before SQL evaluation, so the FROM
+    // filter and topic(3) below still resolve against the fleet/vehicles/+/gps suffix.
+    // The FROM clause is kept (rather than omitted, which Basic Ingest allows) so the
+    // rule also still works if a message arrives over a standard broker topic.
     // Routes all GPS data to Kinesis for processing by Lambda consumer
     new iot.CfnTopicRule(this, "GpsToKinesisRule", {
       ruleName: "fleet_gps_to_kinesis",
@@ -222,10 +238,11 @@ export class IngestionStack extends cdk.Stack {
       },
     });
 
-    // Note: Position updates to Location Service Tracker are handled by the
-    // GPS Processor Lambda (via BatchUpdateDevicePosition) rather than a
-    // separate IoT Rule. This avoids double-billing for position writes
-    // and keeps the Location Service integration in one place.
+    // Note: Position updates to the Location Service tracker are handled by the
+    // native `location` IoT rule action (see GpsToLocationRule in LocationStack),
+    // not by this rule and not by the GPS Processor Lambda. Devices publish to a
+    // separate Basic Ingest topic for that rule, which keeps the Location path
+    // independently filterable while this rule receives every position.
 
     // =========================================================================
     // Active Vehicles Counter

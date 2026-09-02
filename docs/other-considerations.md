@@ -23,12 +23,12 @@ This document compares the Fleet Tracking Platform demo with the [AWS Guidance f
 | **Telemetry Ingestion** | AWS IoT Core → Kinesis Data Streams | AWS IoT Core → Amazon MSK (Kafka) |
 | **Stream Processing** | Lambda (Kinesis consumer) | Apache Flink (stateful) |
 | **Geofencing** | Amazon Location Service API | Flink in-stream evaluation |
-| **Data Storage** | DynamoDB (hot), S3 (archive) | DynamoDB + ElastiCache Redis + S3 |
+| **Data Storage** | DynamoDB (hot, 24h TTL); S3 archive bucket provisioned but not yet wired | DynamoDB + ElastiCache Redis + S3 |
 | **Real-time Updates** | WebSocket API (API Gateway) | WebSocket API |
 | **Vehicle Data Sources** | MQTT Direct only | MQTT Direct + FWE Edge Agent (open-source cloud components) + OEM APIs |
 | **Deployment** | 7 CDK stacks (~25 min) | Phase-based CDK deployment (~33–50 min per AWS docs) |
-| **Costs (20 trucks)** | ~$45–60/month (production) | N/A (designed for 100+) |
-| **Costs (100 vehicles)** | ~$155–235/month (production) | ~$265/month |
+| **Costs (20 trucks)** | ~$27/month (production) | N/A (designed for 100+) |
+| **Costs (100 vehicles)** | ~$85/month (production) | ~$265/month |
 | **Costs (1,000 vehicles)** | Not recommended | ~$400/month |
 
 ### The Key Difference: Geofencing Architecture
@@ -72,16 +72,35 @@ This section explains why this demo uses certain services and when you should co
 
 **Why Kinesis + Lambda works for small fleets:**
 
-- **On-Demand Mode**: No capacity planning required
-- **Lambda Integration**: Lambda polls Kinesis shards automatically
-- **Low Fixed Costs**: No always-on infrastructure. You pay only for actual data processed
-- **Simple Operations**: No cluster management, patching, or broker configuration
+- **Batching**: Kinesis delivers 10 records per Lambda invocation instead of triggering 10 separate invocations
+- **Buffering**: Kinesis absorbs traffic spikes and reduces Lambda throttling
+- **Replay**: 24-hour retention by default, configurable up to 365 days
+- **Multiple consumers**: You can attach an analytics consumer to the same stream later without touching the ingestion path
+- **Partial batch failure**: A bad record is retried without replaying the whole batch, via `reportBatchItemFailures` on the event source mapping plus a handler that returns the failed sequence numbers
+- **Simple operations**: No cluster management, patching, or broker configuration
 
-**Cost Example (80 trucks, 5-second updates):**
-- ~12.6 million messages/month × ~500 bytes = ~6 GB/month
-- Kinesis On-Demand: ~$0.20/month for data + ~$0.10/month retrieval (per-truck)
-- Lambda: ~$8/month (invocations + duration) (per-truck)
-- **Total: ~$8-10/month** (~$0.10/truck — scales with fleet size)
+**Capacity mode matters more than it looks.** This stack defaults to **one provisioned
+shard**, not on-demand (`infra/lib/ingestion-stack.ts`). On-demand bills a flat
+stream-hour charge regardless of how little you send — roughly **$29/month** versus
+**~$11/month** for a single provisioned shard. On a tuned 20-vehicle deployment that one
+line item would cost more than every other pipeline service combined.
+
+One provisioned shard carries **1 MB/sec or 1,000 records/sec**. Twenty vehicles
+reporting every 5 seconds is 4–20 records/sec, and 100 vehicles is about 20/sec, so a
+single shard has substantial headroom:
+
+```bash
+# Add provisioned capacity
+cd infra && npx cdk deploy --all --context kinesisShards=4
+
+# Switch to on-demand — only worth it for genuinely spiky, unpredictable traffic
+cd infra && npx cdk deploy --all --context kinesisOnDemand=true
+```
+
+**Cost example (20 vehicles, 5-second updates):**
+- Kinesis, 1 provisioned shard: ~$10.99/month (fixed — does not scale with fleet size)
+- Lambda (requests + compute): ~$0.42/month
+- **Total: ~$11.41/month**, of which ~96% is the fixed shard charge
 
 #### Production Alternative: Amazon MSK + Apache Flink
 
@@ -170,47 +189,33 @@ This section explains why this demo uses certain services and when you should co
 
 ---
 
-### 4. Time-Series Storage: DynamoDB TTL vs. Timestream
+### 4. Storage tiers: let the query pattern decide
 
-#### This Demo Uses: DynamoDB with 24-Hour TTL + S3 Archive
+Pick a tier based on the question you're asking of the data, not on data volume. Three tiers cover the range:
 
-**Why DynamoDB TTL works for short-term history:**
+| Storage | Use case | Retention | Access pattern |
+|---|---|---|---|
+| [**Amazon DynamoDB**](https://aws.amazon.com/dynamodb/) | Current state, recent history | Hours to days | Point lookups, real-time |
+| [**Amazon Timestream for InfluxDB**](https://docs.aws.amazon.com/timestream/latest/developerguide/influxdb3.html) | Time-series analytics | Weeks to months | Aggregations, trends |
+| [**Amazon S3**](https://aws.amazon.com/s3/) + [**Amazon Athena**](https://aws.amazon.com/athena/) | Archive, AI/ML training | Months to years | Batch queries, as needed |
 
-- **Automatic Expiration**: TTL automatically deletes records after 24 hours, keeping table size manageable.
-- **S3 Export**: DynamoDB export to S3 provides long-term archival at $0.023/GB/month.
-- **No Additional Service**: Reuses existing DynamoDB infrastructure.
+**"Where is vehicle-001 right now?" / "What were its last few positions?"** — point lookups on recent data. This is what the stack deploys: DynamoDB gives [single-digit-millisecond reads](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Introduction.html) by key, and the 24-hour TTL on `gps-history` expires rows automatically so you aren't paying to store history you don't query. For a small fleet this is frequently the only tier required.
 
-**Cost Example (80 trucks, 24-hour retention):**
-- DynamoDB storage: ~1 GB = ~$0.25/month (per-truck)
-- S3 archive: ~10 GB/month = ~$0.23/month (per-truck)
-- **Total: ~$0.50/month** (~$0.006/truck — scales with fleet size)
+- DynamoDB storage for 24-hour retention at 20 vehicles: well under 1 GB, ~$0.25/month
+- No additional service to operate
 
-#### Production Alternative: Amazon Timestream
+**"What was average speed by route last week?" / "Show a heat map of stops this month."** — aggregations over time ranges, which DynamoDB does not specialize in at scale. That's the signal to add **Amazon Timestream for InfluxDB**, which is purpose-built for time-range aggregations and gives you SQL and InfluxQL over months of history without an ETL pipeline.
 
-**Why upgrade to Timestream:**
+Note the trade-off: Timestream for InfluxDB runs on **provisioned DB instances**, which removes the serverless property of the rest of this stack. That may be acceptable overhead for the analytical benefit. If keeping the architecture serverless matters more, DynamoDB plus S3 and Athena delivers a similar analytical experience with per-query billing instead of an always-on instance.
 
-- **Purpose-Built for Time-Series**: Per [Timestream documentation](https://docs.aws.amazon.com/timestream/latest/developerguide/what-is-timestream.html), Timestream automatically moves data between memory and magnetic storage tiers based on age.
-- **SQL Queries on Historical Data**: Query months of GPS history without ETL pipelines.
-- **Built-in Analytics Functions**: Time-series interpolation, smoothing, and aggregation functions.
-- **Automatic Scaling**: No capacity planning for time-series workloads.
+**"Train an ML model on a year of trips." / "Retain raw data for compliance."** — infrequent, large-scale batch reads over long retention. Holding that in DynamoDB or a time-series database is expensive for data you rarely touch. Archive to S3 (~$0.023/GB/month) and query with Athena, where storage is cheap and you pay per query.
 
-**Cost Example (1,000 trucks, 90-day retention):**
-- Writes: ~378M records/month × $0.50/million = ~$189/month (per-truck)
-- Memory storage (7 days): ~50 GB × $0.036/GB-hour × 730 hours = ~$1,314/month (fixed)
-- Magnetic storage (83 days): ~500 GB × $0.03/GB-month = ~$15/month (per-truck)
-- Queries: Variable based on usage
-- **Total: ~$1,500/month**
-
-*Memory storage is a fixed cost. Writes and magnetic storage scale per truck.*
-
-**When to Use Timestream:**
-- Need to query historical GPS data older than 24 hours
-- Building analytics dashboards with time-series visualizations
-- Require SQL access to telemetry data without ETL
+> The stack provisions an S3 archive bucket (`fleet-gps-archive-<account>`) with SSE-S3 encryption, versioning, and a lifecycle rule that transitions to Infrequent Access at 30 days — but **nothing writes to it yet**. Wire up a [DynamoDB export to S3](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/S3DataExport.HowItWorks.html) or a Firehose consumer on the Kinesis stream before treating it as a live archive tier.
 
 **References:**
-- [Amazon Timestream Pricing](https://aws.amazon.com/timestream/pricing/)
 - [DynamoDB TTL](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html)
+- [Amazon Timestream for InfluxDB](https://docs.aws.amazon.com/timestream/latest/developerguide/influxdb3.html)
+- [Querying S3 data with Athena](https://docs.aws.amazon.com/athena/latest/ug/what-is.html)
 
 ---
 
@@ -264,59 +269,83 @@ Costs are organized into three categories:
 
 ---
 
-### Demo Configuration: Per-Truck AWS Costs
+### Demo Configuration: AWS Costs
 
-The demo sends **all GPS positions** to Location Service for continuous geofence evaluation. This is useful for demonstrating real-time arrival detection but expensive at scale.
+The demo, as deployed, reports every 5 seconds and sends every position to Location Service. Useful for demonstrating real-time arrival detection,
+expensive to leave running.
 
-| Service | Per Truck/Month | 20 Trucks/Month | Calculation | Reference |
-|---------|-----------------|-----------------|-------------|-----------|
-| **AWS IoT Core** | | | | [IoT Core Pricing](https://aws.amazon.com/iot-core/pricing/) |
-| - Messaging | $0.158 | $3.17 | 158,400 msgs × $1.00/million | |
-| - Connectivity | $0.001 | $0.02 | 13,200 conn-min × $0.08/million | |
-| - Rules triggered | $0.024 | $0.48 | 158,400 rules × $0.15/million | |
-| - Actions executed | $0.024 | $0.48 | 158,400 actions × $0.15/million | |
-| **Kinesis Data Streams** | $0.20 | $4.00 | On-demand standard mode ($0.08/GB ingress + $0.04/stream-hr) | [Kinesis Pricing](https://aws.amazon.com/kinesis/data-streams/pricing/) |
-| **Lambda** | | | | [Lambda Pricing](https://aws.amazon.com/lambda/pricing/) |
-| - Requests | $0.032 | $0.63 | 158,400 × $0.20/million | |
-| - Compute | $0.066 | $1.32 | 158,400 × 100ms × 256MB × $0.0000166667/GB-s | |
-| **DynamoDB** | | | | [DynamoDB Pricing](https://aws.amazon.com/dynamodb/pricing/on-demand/) |
-| - Writes | $0.099 | $1.98 | 158,400 × $0.625/million WRUs | |
-| - Reads | $0.020 | $0.40 | 158,400 × $0.125/million RRUs | |
-| - Storage | $0.003 | $0.06 | ~3 MB × $0.25/GB | |
-| **Amazon Location Service** | | | | [Location Pricing](https://aws.amazon.com/location/pricing/) |
-| - Position writes | $7.92 | $158.40 | 158,400 × $0.05/1,000 positions | |
-| - Geofence evaluations | $2.53 | $50.69 | 158,400 positions evaluated | |
-| **API Gateway** | | | | [API Gateway Pricing](https://aws.amazon.com/api-gateway/pricing/) |
-| - WebSocket messages | $0.158 | $3.17 | 158,400 × $1.00/million | |
-| - Connection minutes | $0.003 | $0.07 | 13,200 × $0.25/million | |
-| - REST API calls | $0.022 | $0.44 | 6,250 calls × $3.50/million | |
-| **Per-Truck Subtotal (Demo)** | **~$11.30** | **~$225** | | |
+Two clocks drive this bill. Devices publish on a timer for the whole 10-hour shift, which
+sets the pipeline volume (3,168,000 messages/month at 20 vehicles). But `DistanceBased`
+filtering discards movement under 30 m, so **Location Service only bills while a vehicle is
+driving** — 4 of those 10 hours here, or 1,267,200 positions.
 
-*Location Service dominates at ~87% of per-truck costs because every position is evaluated against geofences.*
+| Line item | Demo (5 s, no proximity filter) | Production (30 s, proximity filter) |
+|---|---|---|
+| IoT Core messaging (Basic Ingest) | $0.00 | $0.00 |
+| IoT Core connectivity | $0.02 | $0.02 |
+| IoT Core rules + actions (2 each per ping) | $1.90 | $0.32 |
+| Kinesis Data Streams (1 provisioned shard) | $10.99 | $10.99 |
+| Lambda (requests + compute) | $0.42 | $0.09 |
+| DynamoDB writes | $5.94 | $0.99 |
+| DynamoDB Streams reads | $0.13 | $0.00 |
+| **Location tracker writes** | **$51.85** | **$2.11** |
+| **Location geofence evaluations** | **$151.89** | **$6.76** |
+| Location routes + geocodes (per job) | $2.64 | $2.64 |
+| Location geofence create/delete | $0.18 | $0.18 |
+| API Gateway WebSocket messages | $6.34 | $1.06 |
+| API Gateway WebSocket connection-minutes | $0.01 | $0.01 |
+| CloudWatch Logs (ingest + storage) | $0.67 | $0.11 |
+| CloudWatch metrics + 6 alarms | $2.23 | $2.23 |
+| **Total (20 vehicles)** | **~$235/mo** | **~$27/mo** |
+| **Per vehicle** | **~$11.76** | **~$1.37** |
 
----
+Basis: 20 vehicles, 10-hour connected shift, 4 hours driving, 4 jobs/vehicle/day, 22
+days/month, 2 concurrent dashboards, us-east-1 on-demand rates. Excludes AWS WAF
+(~$16/mo fixed), CloudFront, Cognito, Secrets Manager, X-Ray, DynamoDB PITR, and the
+analytics and multi-tenancy stacks. Lambda duration, log volume, and the share of driving
+spent near a job site are estimates.
 
-### Production-Optimized: Proximity-Based Geofencing
-
-In production, you'd implement **proximity-based geofence evaluation**:
-
-1. GPS Processor Lambda checks if vehicle is within X km of any active job site
-2. Only positions near geofences get sent to Location Service
-3. Vehicles driving on highways or parked at home base skip geofence evaluation entirely
-
-With this optimization, Location Service calls drop by **80-95%** (only ~5-20% of positions are near active geofences).
-
-| Service | Per Truck/Month | 20 Trucks/Month | Notes |
-|---------|-----------------|-----------------|-------|
-| **AWS IoT Core** | $0.21 | $4.15 | Same as demo |
-| **Kinesis Data Streams** | $0.20 | $4.00 | Same as demo |
-| **Lambda** | $0.12 | $2.40 | Slightly more compute for proximity check |
-| **DynamoDB** | $0.12 | $2.44 | Same as demo |
-| **Amazon Location Service** | $1.05-2.10 | $21-42 | Only ~10-20% of positions evaluated |
-| **API Gateway** | $0.18 | $3.68 | Same as demo |
-| **Per-Truck Subtotal (Production)** | **~$1.90-2.85** | **~$38-57** | | |
+*Location Service is ~88% of the demo bill because each position is charged twice, once as
+a tracker write and again as a geofence evaluation. Once tuned it drops to ~43%, and the
+Kinesis shard becomes ~40%.*
 
 ---
+
+### Production-Optimized: two settings
+
+The production column above comes from two simulator settings. Neither requires an
+architectural change. Check the reporting interval before any architectural change — it
+sets how many positions exist to be billed, so it moves the total further than anything
+else.
+
+**1. Reporting interval, 5 s to 30 s.** Sets how many positions exist to be billed, so it
+moves the total further than anything else — about a 78% cut to Location Service. Dispatchers
+rarely notice the difference on a map.
+
+```bash
+PUBLISH_INTERVAL=30000 ./scripts/start-simulator.sh
+```
+
+**2. Proximity filtering.** Only send positions to the tracker when a vehicle is near its
+assigned job destination or home base. The decision is made **on the device**, which already
+received the destination in its dispatch command — no server-side lookup and no Lambda in the
+path. Doing it server-side would mean `get_dynamodb()` in the rule's `WHERE` clause, billed
+per message like a rule action and limited to one call per statement.
+
+```bash
+LOCATION_PROXIMITY_FILTER=true ./scripts/start-simulator.sh
+```
+
+Keep the proximity radius (`LOCATION_PROXIMITY_RADIUS_M`, default 2000) comfortably wider
+than your geofences. ENTER/EXIT events are derived from position updates, so filtering too
+tightly suppresses the EXIT event as a vehicle drives away.
+
+`npm run simulator:production` applies both settings together.
+
+A third lever is not a simulator setting at all: confirm the Kinesis stream is on **one
+provisioned shard** rather than on-demand. See [Stream Processing](#1-stream-processing-kinesis--lambda-vs-msk--flink)
+above — on a tuned deployment, on-demand would cost more than every other pipeline
+service combined.
 
 ### Fixed AWS Costs (Not Per-Truck)
 
@@ -327,27 +356,24 @@ These costs remain constant regardless of fleet size. They are license fees, das
 | **CloudWatch** | ~$3.60 | 1 dashboard + 6 alarms + ~5 GB log ingestion (mostly within free tier) | [CloudWatch Pricing](https://aws.amazon.com/cloudwatch/pricing/) |
 | - Dashboard | $3.00 | 1 dashboard × $3/month | |
 | - Alarms | $0.60 | 6 alarms × $0.10/alarm | |
-| - Custom metrics | $0.00 | 3–4 custom metrics, all within the 10-metric free tier | |
+| - Custom metrics | ~$0.60 | ~12 metric streams for a 5-vehicle demo (`JobsCompleted` carries per-vehicle dimensions); first 10 are free, then $0.30 each | |
 | - Logs | $0.00 | Demo workload typically stays within the 5 GB ingestion free tier | |
 | **Secrets Manager** | $0.40 | 1 secret (demo user password) × $0.40/month | [Secrets Manager Pricing](https://aws.amazon.com/secrets-manager/pricing/) |
 | **S3** | $0.50 | Static dashboard hosting | [S3 Pricing](https://aws.amazon.com/s3/pricing/) |
 | **CloudFront** | $1.00 | Dashboard CDN (minimal traffic) | [CloudFront Pricing](https://aws.amazon.com/cloudfront/pricing/) |
 | **Cognito** | $0.00 | First 50,000 MAUs free | [Cognito Pricing](https://aws.amazon.com/cognito/pricing/) |
-| **Fixed Subtotal (core)** | **~$5.50** | Same for 1 truck or 1,000 trucks. Add ~$9/month if deploying the optional Grafana stack. | |
+| **Fixed Subtotal (core)** | **~$5.50** | Same for 1 truck or 1,000 trucks. | |
 
 ---
 
 ### Total AWS costs summary
 
-| Configuration | 20 Trucks | Per Truck | Notes |
-|---------------|-----------|-----------|-------|
-| **Demo** (all positions to Location Service) | ~$236 | ~$11.80 | Useful for demonstrating real-time geofencing |
-| **Production** (proximity-based geofencing) | ~$45–63 | ~$2.25–3.15 | 80–95% Location Service cost reduction |
+| Configuration | 20 Trucks | Per Truck | 100 Trucks | Per Truck |
+|---|---|---|---|---|
+| **Demo** — as deployed (5 s, all positions to Location Service) | ~$235 | ~$11.76 | ~$858 | ~$8.58 |
+| **Production** — 30 s, proximity filtering | ~$27 | ~$1.37 | ~$85 | ~$0.85 |
 
-| Configuration | 100 Trucks | Per Truck | Notes |
-|---------------|------------|-----------|-------|
-| **Demo** | ~$1,140 | ~$11.40 | Location Service dominates |
-| **Production** | ~$155–235 | ~$1.55–2.35 | Fixed cost amortized; per-truck cost falls |
+Per-truck cost falls as the fleet grows because Location Service pricing is tiered and several charges are fixed. Note the composition shifts too: Location Service is ~88% of the demo bill but only ~43% once tuned, at which point the Kinesis shard is ~40%.
 
 ---
 
@@ -361,9 +387,9 @@ These costs remain constant regardless of fleet size. They are license fees, das
 5. **Batch API calls**: Reduce API Gateway costs by batching vehicle queries client-side
 
 **Fixed cost reductions:**
-1. **Stay on the CloudWatch dashboard**: Avoid the optional Grafana stack to save ~$9/month
-2. **Log retention**: Reduce CloudWatch log retention from 30 days to 7 days
-3. **Alarm consolidation**: Combine related alarms via composite alarms to reduce alarm count
+1. **Log retention**: Reduce CloudWatch log retention from 30 days to 7 days
+2. **Alarm consolidation**: Combine related alarms via composite alarms to reduce alarm count
+3. **Dashboard count**: Each CloudWatch dashboard beyond the first three costs $3/month. Consolidate rather than splitting by team.
 
 **At scale (500+ trucks):**
 1. **Reserved capacity**: 30–50% savings for predictable workloads (MSK, ElastiCache)
@@ -376,11 +402,11 @@ Beyond proximity-based geofencing, Amazon Location Service offers built-in filte
 
 | Filtering Mode | Description | Best For |
 |----------------|-------------|----------|
-| Distance-based | Ignores updates if device moved < 30 meters | Parked vehicles |
-| Accuracy-based | Ignores updates if device moved < reported accuracy | Known device accuracy |
-| Time-based | Stores positions every 30 seconds, evaluates all geofences | Real-time geofencing, minimal history |
+| `DistanceBased` | Movement under 30 m — **ignored updates are neither stored nor evaluated**, so both cost dimensions drop | Parked and slow-moving vehicles. This is what the stack deploys. |
+| `AccuracyBased` | Movement under the device's reported accuracy | Hardware that reports an accuracy value. Not usable with the native Location rule action, which sends no accuracy. |
+| `TimeBased` (service default) | Nothing | Only thins **stored** positions; every update is still evaluated against geofences and billed. Do not pick this expecting savings. |
 
-Combining proximity-based geofencing with distance-based filtering provides the best cost optimization for production deployments.
+Combining proximity-based geofencing with `DistanceBased` filtering provides the best cost optimization for production deployments.
 
 ### Scaling cost projections (production-optimized)
 
@@ -392,7 +418,7 @@ Combining proximity-based geofencing with distance-based filtering provides the 
 | 200 trucks | 31.68M         | ~$210–420        | ~$170     | $5.50 | ~$385–595 | ~$1.95–3.00 |
 | 500 trucks | 79.2M          | ~$525–1,050      | ~$425     | $5.50 | ~$955–1,480 | ~$1.90–2.95 |
 
-*Production-optimized costs assume 10–20% of positions are evaluated against geofences. Fixed costs assume the core platform only — add ~$9/month if you deploy the optional Grafana stack.*
+*Production-optimized costs assume 10–20% of positions are evaluated against geofences. Fixed costs assume the core platform only — any optional integration you layer on (Amazon Managed Grafana, ServiceNow, analytics services) is additional.*
 
 ---
 
@@ -568,7 +594,7 @@ Or use the [Service Quotas Console](https://console.aws.amazon.com/servicequotas
 
 ## Security considerations
 
-For deployment-specific security posture (FSBP compliance, known gaps, encryption settings), see [docs/security.md](./security.md). Below are scaling-related security topics relevant to fleet operators considering production rollout.
+Below are scaling-related security topics relevant to fleet operators considering production rollout. Items verified as deployed in this stack are marked ✅.
 
 ### Device security
 

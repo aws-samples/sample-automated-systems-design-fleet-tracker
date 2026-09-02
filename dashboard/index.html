@@ -4,7 +4,8 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Fleet Tracking Dashboard</title>
-    <link href="https://unpkg.com/maplibre-gl@5.0.0/dist/maplibre-gl.css" rel="stylesheet" />
+    <!-- MapLibre CSS is bundled via an import in src/main.tsx rather than loaded from a
+         CDN, so it can never drift from the installed maplibre-gl version. -->
   </head>
   <body>
     <div id="root"></div>
