@@ -1,6 +1,6 @@
 # Fleet Tracking Platform — Implementation Guide
 
-A real-time GPS fleet tracking backend built on AWS serverless services, designed for small to medium fleets (20–200 vehicles). This repository contains the complete infrastructure-as-code, Lambda handlers, vehicle simulator, and demo dashboard.
+A real-time GPS fleet tracking backend built on AWS serverless services, designed for small to medium fleets (20–200 vehicles). This repository contains infrastructure-as-code, Lambda handlers, vehicle simulator, and demo dashboard to quickly visualize the components for a proof of concept.
 
 ---
 
@@ -67,7 +67,6 @@ cd ..
 - [Architecture](#architecture)
 - [Dispatch system integration](#dispatch-system-integration)
 - [Monitoring and alerting](#monitoring-and-alerting)
-- [Cost summary](#cost-summary)
 - [Cleanup](#cleanup)
 - [Optional extensions](#optional-extensions)
 - [Documentation deep dives](#documentation-deep-dives)
@@ -135,47 +134,6 @@ Positions reach Amazon Location Service without a Lambda in the path. Devices pu
 | `$aws/rules/fleet_gps_to_kinesis/fleet/vehicles/<id>/gps` | `fleet_gps_to_kinesis` | Kinesis → Lambda → DynamoDB | every position |
 | `$aws/rules/fleet_gps_to_location/fleet/vehicles/<id>/gps` | `fleet_gps_to_location` | native [Location action](https://docs.aws.amazon.com/iot/latest/developerguide/location-rule-action.html) → tracker | all positions, or only those near a point of interest |
 
-Two rules rather than two actions on one rule: a rule's `WHERE` clause applies to the whole rule, so a single rule cannot send every position to DynamoDB while sending only a filtered subset to Location Service. Splitting them keeps route playback complete while letting the tracker path be filtered, which matters because Location Service bills per tracker update **and** per geofence evaluation.
-
-### Controlling Amazon Location Service cost
-
-Location Service bills per location update **and** once per linked geofence collection evaluation, so each position counts twice. Two filters stack here, in this order:
-
-**1. Native tracker filtering (primary, zero code).** The tracker is created with `positionFiltering: "DistanceBased"`, so Amazon Location ignores updates where the device moved less than 30 m — and ignored updates are neither stored nor evaluated, cutting both billed dimensions. This is one property on the tracker.
-
-Choose it deliberately, because the modes are not equivalent:
-
-| Mode | Ignored updates | Effect |
-|---|---|---|
-| `DistanceBased` | moved < 30 m | not stored, **not evaluated** — reduces both cost dimensions |
-| `AccuracyBased` | moved < measured accuracy | not stored, not evaluated — but needs accuracy data |
-| `TimeBased` (service default) | none | only thins **storage**; every update is still evaluated and billed |
-
-`AccuracyBased` is unavailable with the native Location rule action, which has no accuracy parameter. Amazon Location treats missing accuracy as zero and applies no filtering at all.
-
-The 30 m threshold is safe against the geofences here (home base 50 m, job sites 100 m) and has a reliability benefit too: it suppresses the repeated enter/exit events a parked vehicle can trigger when it jitters on a geofence edge.
-
-**2. Device-side proximity filtering (optional, additive).** Set `LOCATION_PROXIMITY_FILTER=true` on the simulator to publish to the tracker topic only when a vehicle is near its assigned job destination or home base. This is additive because it avoids the request entirely — native filtering can only act after a position has been sent. The radius (`LOCATION_PROXIMITY_RADIUS_M`, default 2000) must stay comfortably larger than the geofences being evaluated, since ENTER/EXIT events are derived from position updates and over-filtering would suppress the EXIT event.
-
-Note that distance-based savings depend on how much your fleet actually moves. At a 5-second ping, 30 m corresponds to roughly 13 mph: below that, consecutive positions fall inside the threshold and get filtered; on the highway, almost nothing is. Parked and slow-moving vehicles are where the savings come from.
-
-> **Why Kinesis between IoT Rule and Lambda?** Batching efficiency (10 records per invocation vs. 10 separate invocations), traffic spike buffering, 24-hour replay capability, partial batch failure handling, metrics captured, and support for multiple consumers on the same stream.
-
-### Partial batch failure handling
-
-By default, Lambda checkpoints a Kinesis batch only on complete success — any single bad record fails the whole batch and the entire batch is retried. [Partial batch responses](https://docs.aws.amazon.com/lambda/latest/dg/services-kinesis-batchfailurereporting.html) avoid that, and they need **both** halves wired up:
-
-1. `reportBatchItemFailures: true` on the event source mapping (`IngestionStack`)
-2. A handler that returns the failed sequence numbers (`gps-processor` returns `{ batchItemFailures: [{ itemIdentifier }] }`)
-
-Returning the payload without enabling the setting does nothing — Lambda ignores the response and still fails the whole batch.
-
-Two behaviours worth knowing:
-
-- **Successful records can be reprocessed.** Lambda checkpoints at the *lowest* returned sequence number and retries everything from there, so records after the earliest failure may be delivered twice. The GPS processor is safe here because both writes are keyed by `vehicleId` (+ `timestamp` for history), so a replay overwrites rather than duplicates. Keep any handler you add idempotent.
-- **Bisecting interacts with it.** With `bisectBatchOnError: true` also set, the batch is bisected at the returned sequence number and only the remaining records retry.
-
-Records still failing after `retryAttempts: 3` go to the `fleet-gps-processor-dlq` SQS queue.
 
 ---
 
@@ -229,7 +187,7 @@ ws.onmessage = (event) => {
 
 ### Vehicle status lifecycle
 
-The platform tracks vehicles through a status lifecycle. Both automatic transitions are driven by geofence **ENTER** events — there is no EXIT-driven transition:
+The platform tracks vehicles through a status lifecycle. Both automatic transitions are driven by geofence **ENTER** events:
 
 ```
 available ──▶ en-route ──▶ returning ──▶ available
@@ -272,39 +230,6 @@ Six alarms are deployed, all publishing to the `fleet-ops-alerts` SNS topic:
 See [CloudWatch Monitoring Guide](./docs/cloudwatch.md) for thresholds, custom metrics, and how to subscribe an email to the SNS topic.
 
 ---
-
-## Cost summary
-
-> All estimates based on us-east-1 pricing. Verify current rates via the [AWS Pricing Calculator](https://calculator.aws/).
-
-**Basis:** 5-second GPS updates, 10-hour days, 22 days/month (~158K messages/vehicle/month).
-
-| Configuration | 20 vehicles | 100 vehicles |
-|---------------|-------------|--------------|
-| **Demo** — as deployed: 5 s reporting, every position to Location Service | ~$235/mo ($11.76/vehicle) | ~$858/mo ($8.58/vehicle) |
-| **Production** — 30 s reporting, proximity filtering | ~$27/mo ($1.37/vehicle) | ~$85/mo ($0.85/vehicle) |
-
-Amazon Location Service is ~88% of the demo bill, because it charges per tracker write **and** again per geofence evaluation. Two settings close most of the gap, in order of impact:
-
-| Change | How | Effect at 20 vehicles |
-|---|---|---|
-| Reporting interval 5 s → 30 s | `PUBLISH_INTERVAL=30000` | −78% Location Service |
-| Proximity filtering | `LOCATION_PROXIMITY_FILTER=true` | −80% of remaining Location Service |
-
-`npm run simulator:production` sets both together.
-
-The Kinesis stream already defaults to **one provisioned shard** (~$10.95/mo) rather than
-on-demand, which would bill a flat ~$29/mo regardless of volume. A shard carries 1,000
-records/sec; 100 vehicles at 5 s is 20/sec. Use `--context kinesisOnDemand=true` only if your
-traffic is genuinely spiky, or `--context kinesisShards=N` to add capacity.
-
-Note that per-vehicle cost *falls* as the fleet grows: Location Service pricing is tiered, and the Kinesis shard, alarms, and once-a-minute counter Lambda are fixed regardless of fleet size. Amazon Location Service also only bills while a vehicle is **moving** — `DistanceBased` filtering discards sub-30 m jitter, so a parked vehicle costs pipeline charges and nothing at the tracker.
-
-**Additional non-AWS costs** (not included): GPS hardware (~$60–150/unit), cellular data (~$5–15/vehicle/month), professional installation if hardwired.
-
-> For detailed per-service breakdowns and optimization strategies, see [Other Considerations](./docs/other-considerations.md).
-
----
  
 ## Cleanup
 
@@ -321,13 +246,11 @@ cd infra && npx cdk destroy --all --force && cd ..
 ./scripts/post-cleanup.sh
 ```
 
-> **Note:** If your IP changes and the dashboard becomes inaccessible or shows a white screen, run `./scripts/update-ip-allowlist.sh` to refresh the WAF allowlists for both protocols. `deploy-dashboard.sh` also calls this script automatically before each upload.
-
 ---
 
 ## Optional extensions
 
-The core platform exposes the integration points (CloudWatch metrics and alarms, the `fleet-ops-alerts` SNS topic, raw GPS data in DynamoDB and Kinesis) so you can layer on additional tools without modifying the core stacks. Each option below points to AWS-supported guidance rather than custom setup steps.
+The core platform exposes the integration points (CloudWatch metrics and alarms, the `fleet-ops-alerts` SNS topic, raw GPS data in DynamoDB and Kinesis) so you can layer on additional tools without modifying the core stacks.
 
 | Extension | What it adds | How to set it up |
 |-----------|-------------|------------------|
@@ -351,6 +274,6 @@ The core platform exposes the integration points (CloudWatch metrics and alarms,
 
 ## Related AWS resources
 
-- [AWS IoT for Automotive Workshop](https://catalog.workshops.aws/awsiotforautomotive/en-US) — Hands-on automotive IoT patterns
-- [Connected Mobility on AWS](https://docs.aws.amazon.com/guidance/latest/connected-mobility-on-aws/solution-overview.html) — Enterprise-scale connected vehicle guidance (recommended for 200+ vehicles)
-- [Connected Mobility GitHub](https://github.com/aws-solutions-library-samples/guidance-for-connected-mobility-on-aws) — Open-source reference implementation
+- [AWS IoT for Automotive Workshop](https://catalog.workshops.aws/awsiotforautomotive/en-US): Hands-on automotive IoT patterns
+- [Connected Mobility on AWS](https://docs.aws.amazon.com/guidance/latest/connected-mobility-on-aws/solution-overview.html): Enterprise-scale connected vehicle guidance (recommended for 200+ vehicles)
+- [Connected Mobility GitHub](https://github.com/aws-solutions-library-samples/guidance-for-connected-mobility-on-aws): Open-source reference implementation
