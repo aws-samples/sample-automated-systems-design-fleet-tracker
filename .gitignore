@@ -15,6 +15,9 @@ cdk.out/
 .env.*
 !.env.example
 
+# ---- Development tools ----
+.kiro
+
 # ---- IoT device certificates & private keys (provisioned locally, never commit) ----
 # Ignore everything under certs/ EXCEPT the public Amazon Root CA.
 certs/*
