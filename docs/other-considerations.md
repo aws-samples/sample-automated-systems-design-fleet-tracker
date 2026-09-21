@@ -157,7 +157,7 @@ cd infra && npx cdk deploy --all --context kinesisOnDemand=true
 
 #### Production Alternative: Connected Mobility on AWS (Open-Source)
 
-> **Note:** AWS IoT FleetWise (the managed service) will no longer accept new customers after **April 30, 2026**. The Connected Mobility on AWS open-source solution replaces the managed service with open-source cloud-side components while retaining the same FleetWise Edge Agent (FWE).
+> **Note:** AWS IoT FleetWise (the managed service) no longer accept new customers after **April 30, 2026**. The Connected Mobility on AWS open-source solution replaces the managed service with open-source cloud-side components while retaining the same FleetWise Edge Agent (FWE).
 
 **Why upgrade to Connected Mobility open-source data collection:**
 
@@ -383,7 +383,7 @@ Per-truck cost falls as the fleet grows because Location Service pricing is tier
 1. **Proximity-based geofencing**: Only send positions to Location Service when near active job sites — 80–95% reduction in Location Service costs
 2. **Location Service filtering**: Distance-based filtering (only update if device moved ≥30m) reduces position writes for parked vehicles
 3. **Reduce update frequency**: 10-second updates instead of 5-second cuts per-truck telemetry costs roughly in half
-4. **Lambda ARM64 (Graviton)**: ~20% cheaper than x86 with equivalent performance — switch by setting `architecture: lambda.Architecture.ARM_64` on Lambda functions
+4. **Lambda ARM64 (AWS Graviton)**: ~20% cheaper than x86 with equivalent performance — switch by setting `architecture: lambda.Architecture.ARM_64` on Lambda functions
 5. **Batch API calls**: Reduce API Gateway costs by batching vehicle queries client-side
 
 **Fixed cost reductions:**
